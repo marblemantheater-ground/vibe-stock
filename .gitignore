@@ -1,0 +1,10 @@
+.env
+data/
+logs/
+__pycache__/
+*.pyc
+.venv/
+*.txt
+*.log
+.DS_Store
+Thumbs.db
