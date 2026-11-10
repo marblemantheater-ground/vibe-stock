@@ -1,10 +1,31 @@
+# ── 비밀정보 / 실행 산출물 (기기마다 따로 생성) ──
 .env
 data/
 logs/
-__pycache__/
-*.pyc
-.venv/
-*.txt
 *.log
+
+# ── 개인 메모용 txt (requirements.txt 는 반드시 공유) ──
+*.txt
+!requirements.txt
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# ── 편집기: 공유 설정만 커밋 ──
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+
+# ── macOS ──
 .DS_Store
+._*
+.AppleDouble
+
+# ── Windows ──
 Thumbs.db
+desktop.ini

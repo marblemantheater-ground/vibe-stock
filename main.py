@@ -16,6 +16,9 @@ import sys
 import time
 from datetime import datetime, timedelta
 
+if sys.version_info < (3, 11):  # asyncio.wait_for 의 TimeoutError 동작 등 3.11+ 기준으로 작성됨
+    sys.exit(f"Python 3.11 이상이 필요합니다 (현재 {sys.version.split()[0]})")
+
 from broker.account import AccountService, AccountSnapshot
 from config.settings import BASE_DIR, load_settings
 from core.api_client import KisClient

@@ -1,0 +1,12 @@
+{
+    "files.eol": "\n",
+    "files.encoding": "utf8",
+    "files.insertFinalNewline": true,
+    "files.trimTrailingWhitespace": true,
+    "files.exclude": {
+        "**/__pycache__": true
+    },
+    "[bat]": { "files.eol": "\r\n" },
+    "[powershell]": { "files.eol": "\r\n" },
+    "python.terminal.activateEnvironment": true
+}
