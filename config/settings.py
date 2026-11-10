@@ -31,6 +31,10 @@ _TR_IDS: dict[str, tuple[str | None, str | None]] = {
     "overseas_buy": ("TTTT1002U", "VTTT1002U"),        # 미국 매수
     "overseas_sell": ("TTTT1006U", "VTTT1001U"),       # 미국 매도
     "overseas_nccs": ("TTTS3018R", None),              # 미체결내역 (모의 미지원)
+    "overseas_minute_chart": ("HHDFS76950200", "HHDFS76950200"),  # 해외주식 분봉
+    "overseas_cancel": ("TTTT1004U", "VTTT1004U"),     # 정정/취소
+    "overseas_ccnl": ("TTTS3035R", "VTTS3035R"),       # 주문체결내역
+    "overseas_notice": ("H0GSCNI0", "H0GSCNI9"),       # 실시간 체결통보 (웹소켓)
 }
 
 # 초당 요청 한도 (KIS 공지 한도보다 약간 보수적으로)
@@ -52,6 +56,7 @@ class Settings:
     token_refresh_margin_sec: int
     token_cache_path: Path
     seed_access_token: str | None
+    hts_id: str | None   # 체결통보 웹소켓 구독용 (선택)
     seed_access_token_expires: str | None
     ref_symbol: str
     ref_exchange: str
@@ -112,6 +117,7 @@ def load_settings() -> Settings:
         token_refresh_margin_sec=int(os.getenv("KIS_TOKEN_REFRESH_MARGIN_SEC") or 3600),
         token_cache_path=data_dir / f"token_{env}.json",
         seed_access_token=_optional("KIS_ACCESS_TOKEN"),
+        hts_id=_optional("KIS_HTS_ID"),
         seed_access_token_expires=_optional("KIS_ACCESS_TOKEN_EXPIRES"),
         ref_symbol=os.getenv("KIS_REF_SYMBOL") or "AAPL",
         ref_exchange=os.getenv("KIS_REF_EXCHANGE") or "NASD",

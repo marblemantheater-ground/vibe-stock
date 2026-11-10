@@ -18,18 +18,36 @@ cd vibe-stock
 | | Windows | macOS |
 |---|---|---|
 | 상시 실행 | `run.bat` | `./run.sh` |
-| 시세 수신 테스트 | `run.bat --stream-test 60` | `./run.sh --stream-test 60` |
+| 거래일 하루만 실행 후 종료 (스케줄러용) | `run.bat --once` | `./run.sh --once` |
+| N초 테스트 실행 (주문·정산 포함) | `run.bat --stream-test 60` | `./run.sh --stream-test 60` |
+| 정산 보고서 보기 | `run.bat --report` (또는 `--report 2026-11-10`) | `./run.sh --report` |
 
 ## 구조
 
 ```
-main.py              진입점 (세션 대기 → 실시간 시세 → 전략/주문)
+main.py              진입점 (세션 대기 → 실시간 시세 → 전략 → 주문 → 정산)
 config/settings.py   KIS_ENV=paper|real 로 모의/실전 전환
 config/watchlist.csv 매매 대상 종목
+config/strategy.toml 전략·주문 설정 (실전 주문은 allow_real_trading = true 필요)
 core/                토큰·REST·웹소켓·로깅
 broker/account.py    예수금·잔고 조회
+broker/order.py      주문·체결 확인·미체결 취소
 market/clock.py      미국장 세션 판별 (서머타임 자동, 휴장일 연 1회 갱신)
+market/bars.py       분봉 조회·집계
+strategy/            매매 전략 (이동평균 돌파 + 등락률 조건)
+report/settlement.py 거래일 정산 (매매내역·손익·수익률 저장)
 ```
+
+## 정산 데이터 (`data/reports/{paper|real}/`)
+
+| 파일 | 내용 |
+|---|---|
+| `trades/YYYY-MM-DD.csv` | 그날 주문 전체 (주문 1건 = 1행, 거부·취소 포함) |
+| `daily/YYYY-MM-DD.json` | 그날 정산 보고서 (손익·수익률·보유 종목·매매내역) |
+| `daily_summary.csv` | 하루 1행 누적 요약 — 엑셀로 바로 열림 |
+
+- 날짜는 미국 현지 거래일 기준. 실현손익은 수수료·세금 제외 추정치.
+- `data/` 는 git 에 올라가지 않으므로 Windows/macOS 각각 따로 쌓인다.
 
 ## Windows ↔ macOS 공유 규칙
 

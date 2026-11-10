@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -113,10 +114,16 @@ class KisWebSocket:
         self._send_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._dropped = 0
+        self._notice_tr = client.settings.tr_id("overseas_notice")
+        self.on_notice: Callable[[], None] | None = None   # 체결통보 수신 시 호출
 
     # ── 구독 관리 ───────────────────────────────────────────
     async def subscribe_ticks(self, symbol: str, quote_exchange: str) -> None:
         await self._subscribe(TR_TICK, tick_key(symbol, quote_exchange))
+
+    async def subscribe_notices(self, hts_id: str) -> None:
+        """내 계좌 체결통보 구독. 내용은 암호화되어 오지만, 수신 자체를 체결 확인 트리거로 쓴다."""
+        await self._subscribe(self._notice_tr, hts_id)
 
     async def unsubscribe_ticks(self, symbol: str, quote_exchange: str) -> None:
         sub = (TR_TICK, tick_key(symbol, quote_exchange))
@@ -230,8 +237,12 @@ class KisWebSocket:
         except ValueError:
             log.warning("알 수 없는 데이터 프레임: %.100s", raw)
             return
+        if tr_id == self._notice_tr:
+            log.info("체결통보 수신 → 체결내역 확인")
+            if self.on_notice is not None:
+                self.on_notice()
+            return
         if encrypted == "1":
-            log.debug("암호화 프레임 수신 (4단계 체결통보에서 처리): %s", tr_id)
             return
         if tr_id != TR_TICK:
             return

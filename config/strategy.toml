@@ -1,0 +1,30 @@
+# 이동평균 돌파 + 등락률 필터 전략 설정
+# 값을 바꾸고 프로그램을 다시 시작하면 적용된다.
+
+[ma_cross]
+bar_minutes = 1            # 봉 단위(분): 1/2/3/5/10/15/30/60
+short_window = 5           # 단기 이동평균 (봉 개수)
+long_window = 20           # 장기 이동평균 (봉 개수, 119 이하)
+
+# 매수 조건: 골든크로스 + 전일 대비 등락률(%)이 아래 범위 안
+min_change_rate = 0.0
+max_change_rate = 5.0
+
+# 매도 조건: 매입평균가 대비 익절/손절(%) 또는 데드크로스
+take_profit_pct = 3.0
+stop_loss_pct = 2.0
+
+budget_per_trade_usd = 1000   # 1회 매수 예산 (USD) → 수량 = 예산 ÷ 현재가 (내림)
+max_positions = 5             # 동시에 보유할 최대 종목 수
+cooldown_sec = 300            # 한 종목에서 신호가 난 뒤 다음 신호까지 대기(초)
+
+# 신호를 낼 세션: "PRE"(프리마켓), "REGULAR"(정규장), "AFTER"(애프터마켓)
+sessions = ["REGULAR"]
+
+[order]
+slippage_pct = 0.3          # 지정가 = 현재가 ± 0.3% (매수는 위, 매도는 아래) → 사실상 즉시 체결
+order_timeout_sec = 60      # 이 시간 안에 체결되지 않으면 잔량 자동 취소
+poll_interval_sec = 5       # 미체결 주문이 있을 때 체결내역 조회 주기(초)
+max_orders_per_day = 20     # 하루 최대 주문 건수 (거부된 주문 제외)
+dry_run = false             # true: 주문을 보내지 않고 로그만 남김
+allow_real_trading = false  # 실전 계좌(KIS_ENV=real)에서 주문하려면 true 로 바꿔야 함
