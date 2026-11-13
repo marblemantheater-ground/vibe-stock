@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 import tomllib
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 from core.ws_client import Tick
@@ -32,6 +32,7 @@ class MaCrossParams:
     take_profit_pct: float = 3.0
     stop_loss_pct: float = 2.0
     budget_per_trade_usd: float = 1000.0
+    capital_usage_pct: float = 0.0   # > 0 이면 1회 예산 = 주문가능 USD × 이 비율 ÷ max_positions (고정 예산 대신)
     max_positions: int = 5
     cooldown_sec: float = 300.0
     sessions: tuple[Session, ...] = (Session.REGULAR,)
@@ -59,6 +60,24 @@ class MaCrossParams:
             raise ValueError("min_change_rate <= max_change_rate 이어야 합니다")
         if self.bar_minutes not in (1, 2, 3, 5, 10, 15, 30, 60):
             raise ValueError("bar_minutes 는 1/2/3/5/10/15/30/60 중 하나여야 합니다")
+        if not 0 <= self.capital_usage_pct <= 100:
+            raise ValueError("capital_usage_pct 는 0~100 이어야 합니다")
+        if self.max_positions < 1:
+            raise ValueError("max_positions 는 1 이상이어야 합니다")
+
+    def with_budget_from(self, orderable_usd: float | None) -> MaCrossParams:
+        """capital_usage_pct 가 켜져 있으면 주문가능 USD 로 종목당 1회 예산을 정한다.
+        거래일 시작 시 한 번만 계산 → 매수할수록 예산이 줄어드는 일이 없다."""
+        if self.capital_usage_pct <= 0:
+            return self
+        if not orderable_usd or orderable_usd <= 0:
+            log.warning("주문가능 USD 를 알 수 없어 고정 예산 $%s 사용", f"{self.budget_per_trade_usd:,.0f}")
+            return self
+        usable = orderable_usd * self.capital_usage_pct / 100
+        budget = usable / self.max_positions
+        log.info(f"매수 자금: 주문가능 ${orderable_usd:,.2f} × {self.capital_usage_pct:g}% = ${usable:,.2f} "
+                 f"→ 종목당 ${budget:,.2f} (최대 {self.max_positions}종목)")
+        return replace(self, budget_per_trade_usd=budget)
 
 
 def _sma(values: list[float], n: int) -> float:

@@ -103,6 +103,17 @@ class MarketClock:
         w = self.current(dt)
         return w.session if w else Session.CLOSED
 
+    def last_closed_trading_day(self, dt: datetime | None = None) -> date:
+        """정규장이 마감된 가장 최근 거래일 (그날 일봉이 확정된 마지막 날)."""
+        dt = (dt or self.now()).astimezone(ET)
+        ws = self.windows(dt.date())
+        if ws and dt >= ws[1].end:
+            return dt.date()
+        d = dt.date() - timedelta(days=1)
+        while not self.is_trading_day(d):
+            d -= timedelta(days=1)
+        return d
+
     def trading_day_end(self, dt: datetime | None = None) -> datetime | None:
         """dt 가 속한 거래일의 마지막 세션 종료 시각 (거래일이 아니면 None)."""
         dt = (dt or self.now()).astimezone(ET)

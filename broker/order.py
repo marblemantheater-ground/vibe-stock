@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 _ORDER_PATH = "/uapi/overseas-stock/v1/trading/order"
 _CANCEL_PATH = "/uapi/overseas-stock/v1/trading/order-rvsecncl"
 _CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+_NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 _MAX_PAGES = 10
 _UNKNOWN_GIVE_UP_SEC = 60.0   # 전송 결과 불확실 주문을 체결내역에서 못 찾으면 미접수로 확정
 
@@ -67,6 +68,7 @@ class Order:
     message: str = ""
     cancel_requested: bool = False
     cost_basis: float = 0.0   # 매도 주문 시점의 매입평균가 (실현손익 계산용)
+    adopted: bool = False     # 시작 시 계좌에서 불러온 기존 미체결 주문 (이전 실행 또는 HTS 직접 주문)
     created_at: float = field(default_factory=time.monotonic)
     placed_at: datetime = field(default_factory=lambda: datetime.now(KST))
 
@@ -99,6 +101,7 @@ class OrderParams:
     order_timeout_sec: float = 60.0
     poll_interval_sec: float = 5.0
     max_orders_per_day: int = 20
+    cancel_open_orders_on_start: bool = False
     dry_run: bool = False
     allow_real_trading: bool = False
 
@@ -192,7 +195,7 @@ class OrderManager:
             return "수량 0"
         if self.open_orders(signal.symbol):
             return "같은 종목에 미체결 주문이 있음"
-        sent_today = sum(1 for o in self.orders if o.status is not OrderStatus.REJECTED)
+        sent_today = sum(1 for o in self.orders if o.status is not OrderStatus.REJECTED and not o.adopted)
         if sent_today >= self.p.max_orders_per_day:
             return f"일일 주문 한도({self.p.max_orders_per_day}건) 도달"
         snap = self._account.snapshot
@@ -263,9 +266,76 @@ class OrderManager:
                 log.warning("[취소 실패] %s → %s", order, e)
         self._sync_now.set()
 
-    async def cancel_all_open(self) -> None:
+    async def cancel_all_open(self, include_adopted: bool = False) -> None:
         for order in self.open_orders():
-            await self.cancel(order)
+            if include_adopted or not order.adopted:
+                await self.cancel(order)
+
+    # ── 기존 미체결 주문 ────────────────────────────────────
+    async def load_open_orders(self) -> list[Order]:
+        """계좌에 이미 걸려 있는 미체결 주문을 불러와 추적한다 (재시작·HTS 직접 주문 대비).
+
+        불러온 주문은 같은 종목 중복 주문 차단·체결 반영 대상이 되지만, 직접 낸 주문일 수 있으므로
+        cancel_open_orders_on_start = true 가 아니면 자동 취소하지 않는다 (미국주식 주문은 당일 장 마감 시 소멸).
+        """
+        async with self._lock:
+            rows = await self._fetch_open_order_rows()
+
+        snap = self._account.snapshot
+        adopted: list[Order] = []
+        for row in rows:
+            odno = str(row.get("odno", "")).strip()
+            remaining = _num(row.get("nccs_qty"))
+            if (not odno or _norm_odno(odno) in self._by_odno or remaining <= 0
+                    or _norm_odno(row.get("orgn_odno"))                  # 정정·취소 주문 행은 제외
+                    or "거부" in str(row.get("prcs_stat_name", ""))):
+                continue
+            side = Side.SELL if row.get("sll_buy_dvsn_cd") == "01" else Side.BUY
+            symbol = str(row.get("pdno", "")).strip()
+            price = _num(row.get("ft_ord_unpr3"))
+            filled = _num(row.get("ft_ccld_qty"))
+            signal = Signal(symbol, str(row.get("ovrs_excg_cd") or "NASD").strip(), side,
+                            int(_num(row.get("ft_ord_qty"))), price, "기존 미체결 주문")
+            order = Order(signal, price, odno=odno, filled_qty=filled, adopted=True,
+                          avg_fill_price=_num(row.get("ft_ccld_unpr3")),
+                          status=OrderStatus.PARTIAL if filled else OrderStatus.SUBMITTED)
+            if side is Side.SELL and snap and symbol in snap.holdings:
+                order.cost_basis = snap.holdings[symbol].avg_price
+            self.orders.append(order)
+            self._by_odno[_norm_odno(odno)] = order
+            adopted.append(order)
+
+        if not adopted:
+            log.info("기존 미체결 주문 없음")
+            return adopted
+        log.info("기존 미체결 주문 %d건 발견:", len(adopted))
+        for o in adopted:
+            log.info("  %s (미체결 %g주)", o, o.remaining)
+        if self.p.cancel_open_orders_on_start and not self.dry_run:
+            log.info("cancel_open_orders_on_start = true → 기존 미체결 주문 취소")
+            await self.cancel_all_open(include_adopted=True)
+        else:
+            log.info("→ 추적만 합니다 (같은 종목 신규 주문 차단, 체결 시 잔고 반영)")
+        return adopted
+
+    async def _fetch_open_order_rows(self) -> list[dict]:
+        if not self._s.is_real:
+            return await self._fetch_today_orders()   # 모의투자는 미체결 조회 미지원 → 체결내역에서 걸러냄
+        rows: list[dict] = []
+        fk = nk = tr_cont = ""
+        for _ in range(_MAX_PAGES):
+            resp = await self._c.get(_NCCS_PATH, self._s.tr_id("overseas_nccs"), {
+                "CANO": self._s.cano, "ACNT_PRDT_CD": self._s.acnt_prdt_cd,
+                "OVRS_EXCG_CD": "NASD", "SORT_SQN": "DS",   # 실전 NASD = 미국 전체
+                "CTX_AREA_FK200": fk, "CTX_AREA_NK200": nk,
+            }, tr_cont=tr_cont)
+            rows.extend(resp.body.get("output") or [])
+            if not resp.has_next:
+                break
+            fk = resp.body.get("ctx_area_fk200", "")
+            nk = resp.body.get("ctx_area_nk200", "")
+            tr_cont = "N"
+        return rows
 
     # ── 체결 동기화 ─────────────────────────────────────────
     async def run(self) -> None:
@@ -300,7 +370,8 @@ class OrderManager:
                 order.status = OrderStatus.REJECTED
                 order.message = "체결내역에 없음 → 미접수로 판단"
                 log.warning("[주문 미접수 확정] %s", order)
-            elif order.odno and age > self.p.order_timeout_sec and not order.cancel_requested:
+            elif (order.odno and age > self.p.order_timeout_sec and not order.cancel_requested
+                  and not order.adopted):
                 log.info("[미체결 %.0f초 경과] 잔량 취소: %s", age, order)
                 await self.cancel(order)
 
@@ -378,8 +449,9 @@ class OrderManager:
         """전송 중인 주문을 기다리고, 남은 미체결 주문을 취소한 뒤 최종 상태를 확인한다."""
         if self._send_tasks:
             await asyncio.gather(*self._send_tasks, return_exceptions=True)
-        if self.open_orders():
-            log.info("세션 종료: 미체결 주문 %d건 취소", len(self.open_orders()))
+        own_open = [o for o in self.open_orders() if not o.adopted]
+        if own_open:
+            log.info("세션 종료: 미체결 주문 %d건 취소", len(own_open))
             await self.cancel_all_open()
             try:
                 await self.sync()

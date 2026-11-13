@@ -11,6 +11,8 @@
     python main.py --once             # 거래일 하루만 실행하고 정산 후 종료 (작업 스케줄러/cron 용)
     python main.py --stream-test 60   # 세션과 무관하게 60초간 실행 (신호 발생 시 주문도 나감) 후 정산
     python main.py --report           # 가장 최근 정산 보고서 출력 (--report 2026-11-10 처럼 날짜 지정 가능)
+    python main.py --collect-daily    # 미국 전체 종목 일봉 수집 → data/daily/ (장 마감 후 실행, 끊겨도 이어서 진행)
+    python main.py --screen           # 수집한 일봉으로 그랜빌 120일선 조건 검사 → data/screen/
 """
 from __future__ import annotations
 
@@ -33,10 +35,13 @@ from core.logger import setup_logging
 from core.ws_client import KisWebSocket, Tick
 from market.bars import fetch_minute_bars
 from market.clock import ET, MarketClock, Session, fmt_kst
-from market.watchlist import WatchItem, load_watchlist
+from market.daily import DEFAULT_DAILY_COUNT, collect_daily
+from market.universe import load_universe
+from market.watchlist import QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
 from report.settlement import SettlementStore, log_report, settle_day
 from strategy.base import Strategy
 from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
+from strategy.screener import ScreenerParams, run_screen
 
 log = logging.getLogger("main")
 
@@ -137,17 +142,44 @@ class AccountContext:
 
 async def warm_up(client: KisClient, strategy: MovingAverageCrossStrategy,
                   watchlist: list[WatchItem]) -> None:
-    """과거 분봉으로 이동평균 계산에 필요한 봉을 미리 채운다. 실패한 종목은 실시간 봉으로 채워진다."""
+    """과거 분봉으로 이동평균 계산에 필요한 봉을 미리 채운다. 실패한 종목은 실시간 봉으로 채워진다.
+    종목을 동시에 조회한다 (요청 간격은 KisClient 가 지킴) → 40종목도 모의서버에서 1분 안팎."""
     log.info("과거 분봉 조회 중 (%d종목)...", len(watchlist))
-    for item in watchlist:
+
+    async def one(item: WatchItem) -> None:
         try:
             bars = await fetch_minute_bars(client, item, strategy.p.bar_minutes)
         except KisError as e:
             log.warning("[%s] 과거 분봉 조회 실패 → 실시간 봉으로 채움: %s", item.symbol, e)
-            continue
+            return
         strategy.seed(item.symbol, bars)
         log.info("[%s] 과거 %d분봉 %d개 로드 (전략 준비 %s)", item.symbol, strategy.p.bar_minutes,
                  len(bars), "완료" if strategy.ready(item.symbol) else "부족")
+
+    await asyncio.gather(*(one(item) for item in watchlist))
+
+
+def build_trading_list(clock: MarketClock, watchlist: list[WatchItem], account: AccountService,
+                       orders: OrderManager) -> list[WatchItem]:
+    """오늘 실시간으로 받을 종목: 보유(익절·손절 감시) > 미체결 > 관심(watchlist.csv) > 전날 종목 선정 결과."""
+    snap = account.snapshot
+    held = [WatchItem(h.symbol, h.exchange, h.name) for h in (snap.holdings.values() if snap else [])
+            if h.exchange in QUOTE_EXCHANGE]
+    pending = [WatchItem(o.symbol, o.signal.exchange) for o in orders.open_orders()
+               if o.signal.exchange in QUOTE_EXCHANGE]
+    screened: list[WatchItem] = []
+    try:
+        screener = ScreenerParams.from_toml(_STRATEGY_PATH)
+    except (OSError, ValueError) as e:
+        log.warning("[screener] 설정 오류 → 선정 종목 제외: %s", e)
+    else:
+        if screener.add_to_watchlist:
+            day = clock.last_closed_trading_day()
+            path = BASE_DIR / "data" / "screen" / f"{day.isoformat()}.csv"
+            screened = load_screen_result(path)
+            if not path.exists():
+                log.info("%s 종목 선정 결과 없음 (--collect-daily → --screen 실행 시 추가됨)", day)
+    return merge_watchlists([("보유", held), ("미체결", pending), ("관심", watchlist), ("선정", screened)])
 
 
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
@@ -157,8 +189,14 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
     거래일마다 전략·주문 관리자를 새로 만들고, 끝날 때(오류·중단 포함) 미체결 취소 후 정산한다."""
     trading_date = clock.now().astimezone(ET).date()
     start_snap = account.snapshot
-    strategy: Strategy = MovingAverageCrossStrategy(params, watchlist)
+    params = params.with_budget_from(start_snap.orderable_usd if start_snap else None)
     orders = OrderManager(client, account, order_params)
+    try:
+        await orders.load_open_orders()
+    except KisError as e:
+        log.warning("기존 미체결 주문 조회 실패 (계속 진행, 중복 주문 주의): %s", e)
+    watchlist = build_trading_list(clock, watchlist, account, orders)
+    strategy: Strategy = MovingAverageCrossStrategy(params, watchlist)
     ctx = AccountContext(account, orders)
     await warm_up(client, strategy, watchlist)
 
@@ -252,6 +290,37 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
             return
 
 
+async def run_collect_daily(client: KisClient, clock: MarketClock, limit: int | None) -> int:
+    """미국 전체 종목(주식, $1 이상)의 일봉을 모은다. 이미 받은 종목은 건너뛰므로 다시 실행하면 이어서 진행."""
+    if clock.session() is not Session.CLOSED:
+        log.warning("지금은 %s 시간입니다. 매매 프로그램과 동시에 돌리면 요청 한도를 나눠 쓰게 되니 장 마감 후 실행을 권장합니다",
+                    clock.session().label)
+    try:
+        items = await load_universe(BASE_DIR / "data" / "universe")
+    except Exception as e:   # 마스터 파일을 한 번도 못 받은 경우
+        log.critical("종목 목록을 가져오지 못했습니다: %s", e)
+        return 1
+    if limit:
+        items = items[:limit]
+    last_day = clock.last_closed_trading_day()
+    log.info("일봉 수집 시작: %d종목, %s 까지 %d일치", len(items), last_day, DEFAULT_DAILY_COUNT)
+    stats = await collect_daily(client, items, BASE_DIR / "data" / "daily", last_day)
+    return 0 if stats.failed < max(1, stats.total // 10) else 1
+
+
+async def run_screener(clock: MarketClock) -> int:
+    """수집된 일봉으로 종목 선정 (서버 요청 없음, 종목 목록만 필요)."""
+    try:
+        params = ScreenerParams.from_toml(_STRATEGY_PATH)
+        items = await load_universe(BASE_DIR / "data" / "universe")
+    except Exception as e:
+        log.critical("종목 선정 준비 실패: %s", e)
+        return 1
+    run_screen(items, BASE_DIR / "data" / "daily", clock.last_closed_trading_day(), params,
+               BASE_DIR / "data" / "screen")
+    return 0
+
+
 def show_report(store: SettlementStore, which: str) -> int:
     if which == "latest":
         saved = sorted(store.report_path(date.today()).parent.glob("*.json"))
@@ -283,6 +352,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--once", action="store_true", help="거래일 하루만 실행하고 정산 후 종료")
     p.add_argument("--report", nargs="?", const="latest", metavar="YYYY-MM-DD",
                    help="저장된 정산 보고서 출력 (날짜 생략 시 가장 최근)")
+    p.add_argument("--collect-daily", action="store_true", help="미국 전체 종목 일봉 수집 후 종료")
+    p.add_argument("--limit", type=int, metavar="N", help="--collect-daily 를 앞쪽 N종목만 (테스트용)")
+    p.add_argument("--screen", action="store_true", help="수집한 일봉으로 종목 선정 후 종료")
     return p.parse_args(argv)
 
 
@@ -316,6 +388,11 @@ async def main(argv: list[str] | None = None) -> int:
         log.info("주문 모드: %s 계좌로 실제 주문 전송", "실전" if settings.is_real else "모의투자")
 
     clock = MarketClock()
+    if args.screen:
+        return await run_screener(clock)
+    if args.collect_daily:
+        async with KisClient(settings) as client:
+            return await run_collect_daily(client, clock, args.limit)
     async with KisClient(settings) as client:
         account = AccountService(client)
         try:

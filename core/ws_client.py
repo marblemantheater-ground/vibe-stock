@@ -74,9 +74,9 @@ class Tick:
     def parse(cls, values: list[str]) -> Tick:
         r = dict(zip(_TICK_FIELDS, values))
         sign = r.get("sign", "")
-        diff = _f(r.get("diff", ""))
-        if sign in ("4", "5"):   # 4: 하한, 5: 하락
-            diff = -abs(diff)
+        diff, rate = _f(r.get("diff", "")), _f(r.get("rate", ""))
+        if sign in ("4", "5"):   # 4: 하한, 5: 하락 → 값에 부호가 빠져 와도 음수로 (등락률은 매수 필터에 쓰임)
+            diff, rate = -abs(diff), -abs(rate)
         try:
             kst_time = datetime.strptime(r["kymd"] + r["khms"], "%Y%m%d%H%M%S").replace(tzinfo=KST)
         except (KeyError, ValueError):
@@ -89,7 +89,7 @@ class Tick:
             high=_f(r.get("high", "")),
             low=_f(r.get("low", "")),
             change=diff,
-            change_rate=_f(r.get("rate", "")),
+            change_rate=rate,
             bid=_f(r.get("pbid", "")),
             ask=_f(r.get("pask", "")),
             volume=_f(r.get("evol", "")),
