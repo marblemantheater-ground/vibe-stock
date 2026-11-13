@@ -69,6 +69,8 @@ class Tick:
     market_type: str       # 장중/장전/장후
     kst_time: datetime | None
     received_at: float     # time.monotonic()
+    bid_size: float = 0.0  # 최우선 매수호가 잔량 (주)
+    ask_size: float = 0.0  # 최우선 매도호가 잔량 (주)
 
     @classmethod
     def parse(cls, values: list[str]) -> Tick:
@@ -92,6 +94,8 @@ class Tick:
             change_rate=rate,
             bid=_f(r.get("pbid", "")),
             ask=_f(r.get("pask", "")),
+            bid_size=_f(r.get("vbid", "")),
+            ask_size=_f(r.get("vask", "")),
             volume=_f(r.get("evol", "")),
             cum_volume=_f(r.get("tvol", "")),
             strength=_f(r.get("strn", "")),

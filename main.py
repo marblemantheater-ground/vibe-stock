@@ -31,13 +31,15 @@ from broker.order import OrderManager, OrderParams
 from config.settings import BASE_DIR, load_settings
 from core.api_client import KisClient
 from core.exceptions import KisApiError, KisAuthError, KisError
+from core.instance_lock import AlreadyRunning, InstanceLock
+from core.notifier import NOTIFY, setup_slack
 from core.logger import setup_logging
 from core.ws_client import KisWebSocket, Tick
 from market.bars import fetch_minute_bars
 from market.clock import ET, MarketClock, Session, fmt_kst
 from market.daily import DEFAULT_DAILY_COUNT, collect_daily
 from market.universe import load_universe
-from market.watchlist import QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
+from market.watchlist import MAX_SYMBOLS, QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
 from report.settlement import SettlementStore, log_report, settle_day
 from strategy.base import Strategy
 from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
@@ -118,7 +120,7 @@ class TickReporter:
         t = f"{tick.kst_time:%H:%M:%S}" if tick.kst_time else "-"
         log.info(
             f"[시세] {tick.symbol:<5} ${tick.price:,.2f} ({tick.change_rate:+.2f}%) "
-            f"매수 {tick.bid:,.2f} / 매도 {tick.ask:,.2f}  누적 {tick.cum_volume:,.0f}주  "
+            f"매수 {tick.bid:,.2f}({tick.bid_size:,.0f}) / 매도 {tick.ask:,.2f}({tick.ask_size:,.0f})  누적 {tick.cum_volume:,.0f}주  "
             f"[{tick.market_type} {t}]"
         )
 
@@ -160,8 +162,9 @@ async def warm_up(client: KisClient, strategy: MovingAverageCrossStrategy,
 
 
 def build_trading_list(clock: MarketClock, watchlist: list[WatchItem], account: AccountService,
-                       orders: OrderManager) -> list[WatchItem]:
-    """오늘 실시간으로 받을 종목: 보유(익절·손절 감시) > 미체결 > 관심(watchlist.csv) > 전날 종목 선정 결과."""
+                       orders: OrderManager) -> tuple[list[WatchItem], set[str]]:
+    """오늘 실시간으로 받을 종목: 보유(익절·손절 감시) > 미체결 > 관심(watchlist.csv) > 전날 종목 선정 결과.
+    반환: (감시 종목, 매수 대상 종목 = 관심 + 선정). 매수 대상이 아닌 종목은 보유·미체결이 끝나면 감시를 해제한다."""
     snap = account.snapshot
     held = [WatchItem(h.symbol, h.exchange, h.name) for h in (snap.holdings.values() if snap else [])
             if h.exchange in QUOTE_EXCHANGE]
@@ -179,7 +182,66 @@ def build_trading_list(clock: MarketClock, watchlist: list[WatchItem], account: 
             screened = load_screen_result(path)
             if not path.exists():
                 log.info("%s 종목 선정 결과 없음 (--collect-daily → --screen 실행 시 추가됨)", day)
-    return merge_watchlists([("보유", held), ("미체결", pending), ("관심", watchlist), ("선정", screened)])
+    merged = merge_watchlists([("보유", held), ("미체결", pending), ("관심", watchlist), ("선정", screened)])
+    return merged, {w.symbol for w in (*watchlist, *screened)}
+
+
+class HoldingWatcher:
+    """잔고가 바뀌면 실시간 감시 목록을 맞춘다 (키움 강의: 잔고 0 → 잔고 딕셔너리 삭제 + SetRealRemove).
+
+    - 새로 보유한 종목(HTS 직접 매수 등)이 감시 밖이면 실시간 등록 → 익절·손절 감시
+      (한도 40종목이 차 있으면 보유·미체결이 아닌 가장 낮은 순위 종목을 빼고 넣는다)
+    - 매수 대상(관심·선정)이 아닌데 보유·미체결 때문에 감시하던 종목은 다 팔리면 실시간 해제
+    """
+
+    def __init__(self, client: KisClient, ws: KisWebSocket, strategy: MovingAverageCrossStrategy,
+                 account: AccountService, orders: OrderManager, items: list[WatchItem], targets: set[str]):
+        self._c, self._ws, self._strategy = client, ws, strategy
+        self._account, self._orders = account, orders
+        self.subscribed: dict[str, WatchItem] = {w.symbol: w for w in items}   # 우선순위 순서 유지
+        self._targets = targets
+        self._last_snap = account.snapshot
+        self._tasks: set[asyncio.Task] = set()
+
+    async def check(self) -> None:
+        snap = self._account.snapshot
+        if snap is None or snap is self._last_snap:
+            return   # 잔고가 다시 조회됐을 때만 (체결 반영 시 refresh 가 새 스냅샷을 만든다)
+        self._last_snap = snap
+        held = {s: h for s, h in snap.holdings.items() if h.quantity > 0 and h.exchange in QUOTE_EXCHANGE}
+        pending = {o.symbol for o in self._orders.open_orders()}
+
+        for sym in [s for s in self.subscribed if s not in self._targets and s not in held and s not in pending]:
+            await self._drop(sym, "보유 0주")
+        for sym, h in held.items():
+            if sym in self.subscribed:
+                continue
+            if len(self.subscribed) >= MAX_SYMBOLS:
+                victim = next((s for s in reversed(self.subscribed) if s not in held and s not in pending), None)
+                if victim is None:
+                    log.warning("[감시 추가 실패] %s: 실시간 한도 %d종목이 모두 보유·미체결 종목", sym, MAX_SYMBOLS)
+                    continue
+                await self._drop(victim, f"한도 {MAX_SYMBOLS}종목 → 보유 종목 {sym} 우선")
+            item = WatchItem(sym, h.exchange, h.name)
+            self.subscribed[sym] = item
+            self._strategy.add_item(item)
+            await self._ws.subscribe_ticks(sym, item.quote_exchange)
+            log.info("[감시 추가] 새 보유 종목 %s %g주 → 실시간 시세 등록, 익절·손절 감시 (%d종목)",
+                     sym, h.quantity, len(self.subscribed))
+            task = asyncio.create_task(warm_up(self._c, self._strategy, [item]), name=f"warm-{sym}")
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _drop(self, sym: str, why: str) -> None:
+        item = self.subscribed.pop(sym)
+        await self._ws.unsubscribe_ticks(sym, item.quote_exchange)
+        self._strategy.remove_item(sym)
+        log.info("[감시 해제] %s: %s → 실시간 시세 해제 (%d종목)", sym, why, len(self.subscribed))
+
+    async def close(self) -> None:
+        for task in self._tasks:
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
 
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
@@ -195,7 +257,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         await orders.load_open_orders()
     except KisError as e:
         log.warning("기존 미체결 주문 조회 실패 (계속 진행, 중복 주문 주의): %s", e)
-    watchlist = build_trading_list(clock, watchlist, account, orders)
+    watchlist, targets = build_trading_list(clock, watchlist, account, orders)
     strategy: Strategy = MovingAverageCrossStrategy(params, watchlist)
     ctx = AccountContext(account, orders)
     await warm_up(client, strategy, watchlist)
@@ -210,6 +272,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         log.info("KIS_HTS_ID 미설정 → 체결통보 없이 %.0f초 주기 조회로 체결 확인", order_params.poll_interval_sec)
     if isinstance(until, timedelta):
         until = clock.now() + until
+    watcher = HoldingWatcher(client, ws, strategy, account, orders, watchlist, targets)
     ws_task = asyncio.create_task(ws.run(), name="kis-websocket")
     order_task = asyncio.create_task(orders.run(), name="order-sync")
     reporter = TickReporter()
@@ -220,6 +283,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
             if ws_task.done():
                 ws_task.result()   # 복구 불가 예외면 여기서 전파
                 break
+            await watcher.check()
             current = clock.session()
             if current != session:
                 log.info("세션 전환: %s → %s", session.label, current.label)
@@ -229,6 +293,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
             except TimeoutError:
                 continue
             reporter.on_tick(tick)
+            orders.on_tick(tick.symbol, tick.price)
             try:
                 signals = strategy.on_tick(tick, session, ctx)
             except Exception:
@@ -238,6 +303,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 log.info("[신호] %s", signal)
                 orders.submit(signal)
     finally:
+        await watcher.close()
         await orders.close()
         order_task.cancel()
         await ws.stop()
@@ -354,7 +420,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="저장된 정산 보고서 출력 (날짜 생략 시 가장 최근)")
     p.add_argument("--collect-daily", action="store_true", help="미국 전체 종목 일봉 수집 후 종료")
     p.add_argument("--limit", type=int, metavar="N", help="--collect-daily 를 앞쪽 N종목만 (테스트용)")
-    p.add_argument("--screen", action="store_true", help="수집한 일봉으로 종목 선정 후 종료")
+    p.add_argument("--screen", action="store_true",
+                   help="수집한 일봉으로 종목 선정 후 종료 (--collect-daily 와 함께 쓰면 수집 → 선정 순서로 실행)")
     return p.parse_args(argv)
 
 
@@ -373,7 +440,11 @@ async def main(argv: list[str] | None = None) -> int:
     store = SettlementStore(BASE_DIR / "data", settings.env)
     if args.report:
         return show_report(store, args.report)
-    log.info("=== vibe-stock 시작 (환경: %s, 계좌: %s-**) ===", settings.env.upper(), settings.cano[:4] + "****")
+    if not args.report:
+        setup_slack(settings.slack_webhook_url, prefix="[모의] " if not settings.is_real else "[실전] ")
+    job_label = "일봉 수집·종목 선정" if (args.collect_daily or args.screen) else "매매"
+    log.info("=== vibe-stock 시작: %s (환경: %s, 계좌: %s-**) ===", job_label, settings.env.upper(),
+             settings.cano[:4] + "****", extra=NOTIFY)
     if not watchlist:
         log.critical("매매 대상 종목이 없습니다: %s", _WATCHLIST_PATH)
         return 2
@@ -388,11 +459,27 @@ async def main(argv: list[str] | None = None) -> int:
         log.info("주문 모드: %s 계좌로 실제 주문 전송", "실전" if settings.is_real else "모의투자")
 
     clock = MarketClock()
-    if args.screen:
-        return await run_screener(clock)
+    # 같은 작업이 겹쳐 실행되지 않게 (작업 스케줄러·더블클릭 중복 등). 매매와 일봉 수집은 서로 다른 잠금
+    job = "daily" if (args.collect_daily or args.screen) else "trader"
+    try:
+        with InstanceLock(BASE_DIR / "data" / f"{job}.{settings.env}.lock"):
+            return await run_job(args, settings, clock, watchlist, params, order_params, store)
+    except AlreadyRunning as e:
+        log.error("%s → 이번 실행은 종료합니다", e)
+        return 3
+
+
+async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchlist: list[WatchItem],
+                  params: MaCrossParams, order_params: OrderParams, store: SettlementStore) -> int:
     if args.collect_daily:
         async with KisClient(settings) as client:
-            return await run_collect_daily(client, clock, args.limit)
+            rc = await run_collect_daily(client, clock, args.limit)
+        if not args.screen:
+            return rc
+        # 수집이 일부 실패해도 받은 종목으로 선정은 진행 (최신 일봉이 없는 종목은 선정에서 자동 제외)
+        return await run_screener(clock) or rc
+    if args.screen:
+        return await run_screener(clock)
     async with KisClient(settings) as client:
         account = AccountService(client)
         try:

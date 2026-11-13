@@ -22,6 +22,7 @@ from pathlib import Path
 from broker.account import AccountService
 from core.api_client import KisClient
 from core.exceptions import KisApiError, KisError, KisNetworkError
+from core.notifier import NOTIFY
 from market.clock import ET, KST
 from strategy.base import Side, Signal
 
@@ -33,6 +34,7 @@ _CCNL_PATH = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
 _NCCS_PATH = "/uapi/overseas-stock/v1/trading/inquire-nccs"
 _MAX_PAGES = 10
 _UNKNOWN_GIVE_UP_SEC = 60.0   # 전송 결과 불확실 주문을 체결내역에서 못 찾으면 미접수로 확정
+_IDLE_SYNC_SEC = 60.0         # 미체결이 없어도 이 주기로 체결내역 확인 (실행 중 HTS 등에서 낸 주문 감지)
 
 
 class OrderStatus(str, Enum):
@@ -101,6 +103,8 @@ class OrderParams:
     order_timeout_sec: float = 60.0
     poll_interval_sec: float = 5.0
     max_orders_per_day: int = 20
+    max_buys_per_symbol: int = 1               # 한 종목을 하루에 매수할 수 있는 횟수 (0 = 제한 없음)
+    cancel_buy_above_limit: bool = True        # 현재가가 매수 지정가를 넘으면 미체결 매수를 바로 취소
     cancel_open_orders_on_start: bool = False
     dry_run: bool = False
     allow_real_trading: bool = False
@@ -117,6 +121,8 @@ class OrderParams:
             raise ValueError("slippage_pct 는 0 이상 5 미만이어야 합니다")
         if params.poll_interval_sec < 1 or params.order_timeout_sec < params.poll_interval_sec:
             raise ValueError("poll_interval_sec >= 1, order_timeout_sec >= poll_interval_sec 이어야 합니다")
+        if params.max_buys_per_symbol < 0:
+            raise ValueError("max_buys_per_symbol 은 0 이상이어야 합니다")
         return params
 
 
@@ -148,7 +154,10 @@ class OrderManager:
         self._by_odno: dict[str, Order] = {}
         self._lock = asyncio.Lock()
         self._sync_now = asyncio.Event()
-        self._send_tasks: set[asyncio.Task] = set()
+        self._send_tasks: set[asyncio.Task] = set()   # 전송·취소 백그라운드 작업
+        self._escape_canceling: set[int] = set()       # 가격 이탈 취소를 이미 시작한 주문 (틱마다 중복 방지)
+        self._seen_odnos: set[str] = set()             # 시작 시 이미 있던 오늘 주문 (외부 주문 감지에서 제외)
+        self._baseline_ready = False                   # _seen_odnos 를 채웠는지 (못 채웠으면 첫 동기화 때 채움)
         self.dry_run = params.dry_run or (self._s.is_real and not params.allow_real_trading)
         if self._s.is_real and not params.allow_real_trading and not params.dry_run:
             log.warning("실전 계좌지만 allow_real_trading = false → 주문을 보내지 않습니다 (신호만 기록)")
@@ -159,6 +168,30 @@ class OrderManager:
 
     def pending_buy_symbols(self) -> set[str]:
         return {o.symbol for o in self.open_orders() if o.side is Side.BUY}
+
+    def buys_today(self, symbol: str) -> int:
+        """오늘 이 프로그램이 낸 매수 중 체결됐거나(일부 포함) 진행 중인 건수 (키움 강의의 당일 매수 장부).
+        체결 없이 취소·거부된 주문은 세지 않으므로 다시 매수할 수 있다."""
+        return sum(1 for o in self.orders
+                   if o.symbol == symbol and o.side is Side.BUY and not o.adopted
+                   and (o.filled_qty > 0 or o.status.is_open or o.status is OrderStatus.DRY_RUN))
+
+    def on_tick(self, symbol: str, price: float) -> None:
+        """실시간 체결가로 미체결 매수를 점검: 가격이 지정가 위로 달아나면 체결될 가능성이 낮으므로 바로 취소한다
+        (시간 초과 취소를 기다리지 않음). 기존 계좌 미체결(adopted)은 건드리지 않는다."""
+        if not self.p.cancel_buy_above_limit or self.dry_run:
+            return
+        for order in self.open_orders(symbol):
+            if (order.side is Side.BUY and order.odno and not order.adopted and not order.cancel_requested
+                    and price > order.limit_price and id(order) not in self._escape_canceling):
+                self._escape_canceling.add(id(order))
+                log.info("[가격 이탈] %s 현재가 $%s > 지정가 → 잔량 취소", symbol, f"{price:,.2f}")
+                self._spawn(self.cancel(order), f"cancel-{symbol}")
+
+    def _spawn(self, coro, name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
 
     def request_sync(self) -> None:
         """체결통보 수신 등으로 즉시 체결내역을 확인하고 싶을 때 호출."""
@@ -185,9 +218,7 @@ class OrderManager:
             log.info("[주문-미전송] %s", order)
             return order
 
-        task = asyncio.create_task(self._send(order), name=f"order-{signal.symbol}")
-        self._send_tasks.add(task)
-        task.add_done_callback(self._send_tasks.discard)
+        self._spawn(self._send(order), f"order-{signal.symbol}")
         return order
 
     def _precheck(self, signal: Signal, limit: float) -> str | None:
@@ -203,6 +234,8 @@ class OrderManager:
             return "잔고 정보 없음"
 
         if signal.side is Side.BUY:
+            if self.p.max_buys_per_symbol and (n := self.buys_today(signal.symbol)) >= self.p.max_buys_per_symbol:
+                return f"오늘 이미 매수한 종목 ({n}회, 한도 {self.p.max_buys_per_symbol}회)"
             reserved = sum(o.remaining * o.limit_price for o in self.open_orders() if o.side is Side.BUY)
             available = snap.orderable_usd - reserved
             cost = signal.qty * limit
@@ -230,7 +263,7 @@ class OrderManager:
                 resp = await self._c.post(_ORDER_PATH, tr_id, body)
             except KisApiError as e:
                 order.status, order.message = OrderStatus.REJECTED, f"{e.msg_cd} {e.msg}"
-                log.warning("[주문 거부] %s → %s", order, order.message)
+                log.warning("[주문 거부] %s → %s", order, order.message, extra=NOTIFY)
                 return
             except KisError as e:
                 # 서버 도달 여부를 모름 → 재전송하지 않고 체결내역 조회로 확인 (중복 주문 방지)
@@ -280,6 +313,9 @@ class OrderManager:
         """
         async with self._lock:
             rows = await self._fetch_open_order_rows()
+            today = rows if not self._s.is_real else await self._fetch_today_orders()
+        self._seen_odnos.update(_norm_odno(r.get("odno")) for r in today)
+        self._baseline_ready = True
 
         snap = self._account.snapshot
         adopted: list[Order] = []
@@ -290,20 +326,7 @@ class OrderManager:
                     or _norm_odno(row.get("orgn_odno"))                  # 정정·취소 주문 행은 제외
                     or "거부" in str(row.get("prcs_stat_name", ""))):
                 continue
-            side = Side.SELL if row.get("sll_buy_dvsn_cd") == "01" else Side.BUY
-            symbol = str(row.get("pdno", "")).strip()
-            price = _num(row.get("ft_ord_unpr3"))
-            filled = _num(row.get("ft_ccld_qty"))
-            signal = Signal(symbol, str(row.get("ovrs_excg_cd") or "NASD").strip(), side,
-                            int(_num(row.get("ft_ord_qty"))), price, "기존 미체결 주문")
-            order = Order(signal, price, odno=odno, filled_qty=filled, adopted=True,
-                          avg_fill_price=_num(row.get("ft_ccld_unpr3")),
-                          status=OrderStatus.PARTIAL if filled else OrderStatus.SUBMITTED)
-            if side is Side.SELL and snap and symbol in snap.holdings:
-                order.cost_basis = snap.holdings[symbol].avg_price
-            self.orders.append(order)
-            self._by_odno[_norm_odno(odno)] = order
-            adopted.append(order)
+            adopted.append(self._adopt_row(row, "기존 미체결 주문", snap))
 
         if not adopted:
             log.info("기존 미체결 주문 없음")
@@ -317,6 +340,38 @@ class OrderManager:
         else:
             log.info("→ 추적만 합니다 (같은 종목 신규 주문 차단, 체결 시 잔고 반영)")
         return adopted
+
+    def _adopt_row(self, row: dict, reason: str, snap) -> Order:
+        """체결내역·미체결 행으로 '이 프로그램이 내지 않은 주문'을 만들어 추적 목록에 넣는다."""
+        odno = str(row.get("odno", "")).strip()
+        side = Side.SELL if row.get("sll_buy_dvsn_cd") == "01" else Side.BUY
+        symbol = str(row.get("pdno", "")).strip()
+        price = _num(row.get("ft_ord_unpr3"))
+        filled = _num(row.get("ft_ccld_qty"))
+        signal = Signal(symbol, str(row.get("ovrs_excg_cd") or "NASD").strip(), side,
+                        int(_num(row.get("ft_ord_qty"))), price, reason)
+        order = Order(signal, price, odno=odno, filled_qty=filled, adopted=True,
+                      avg_fill_price=_num(row.get("ft_ccld_unpr3")),
+                      status=OrderStatus.PARTIAL if filled else OrderStatus.SUBMITTED)
+        if side is Side.SELL and snap and symbol in snap.holdings:
+            order.cost_basis = snap.holdings[symbol].avg_price
+        self.orders.append(order)
+        self._by_odno[_norm_odno(odno)] = order
+        self._seen_odnos.add(_norm_odno(odno))
+        return order
+
+    def _match_external(self, row: dict) -> Order | None:
+        """실행 중 HTS·앱 등에서 새로 낸 주문을 감지해 추적에 추가한다 (키움 체잔 이벤트가 HTS 주문도 알려주는 것과 같은 효과)."""
+        odno = _norm_odno(row.get("odno"))
+        if (not odno or odno in self._seen_odnos or _norm_odno(row.get("orgn_odno"))
+                or "거부" in str(row.get("prcs_stat_name", ""))):
+            return None
+        order = self._adopt_row(row, "외부 주문 (HTS 등)", self._account.snapshot)
+        order.status = OrderStatus.SUBMITTED   # 상태는 바로 이어지는 _apply 에서 확정
+        prev_filled, order.filled_qty = order.filled_qty, 0.0   # 이미 체결된 수량도 '새 체결'로 반영되게
+        log.info("[외부 주문 감지] %s %s %d주 지정가 $%s #%s (체결 %g주)", order.side.label, order.symbol,
+                 order.qty, f"{order.limit_price:,.2f}", order.odno, prev_filled, extra=NOTIFY)
+        return order
 
     async def _fetch_open_order_rows(self) -> list[dict]:
         if not self._s.is_real:
@@ -339,15 +394,20 @@ class OrderManager:
 
     # ── 체결 동기화 ─────────────────────────────────────────
     async def run(self) -> None:
-        """미체결 주문이 있는 동안 주기적으로 체결내역을 조회한다. 취소(cancel)될 때까지 실행."""
+        """체결내역을 조회해 주문 상태를 갱신한다. 취소(cancel)될 때까지 실행.
+        미체결이 있으면 poll_interval_sec 마다, 없으면 _IDLE_SYNC_SEC 마다 (외부 주문 감지),
+        체결통보 등으로 request_sync() 가 오면 즉시 조회한다."""
+        last_sync = time.monotonic()
         while True:
             try:
                 await asyncio.wait_for(self._sync_now.wait(), timeout=self.p.poll_interval_sec)
+                requested = True
             except TimeoutError:
-                pass
+                requested = False
             self._sync_now.clear()
-            if not self.open_orders():
+            if not (requested or self.open_orders() or time.monotonic() - last_sync >= _IDLE_SYNC_SEC):
                 continue
+            last_sync = time.monotonic()
             try:
                 await self.sync()
             except KisError as e:
@@ -357,9 +417,13 @@ class OrderManager:
         async with self._lock:
             rows = await self._fetch_today_orders()
 
+        if not self._baseline_ready:   # 시작 시 조회 실패 → 지금 있는 주문은 '실행 전 주문'으로 보고 외부 감지에서 제외
+            self._seen_odnos.update(_norm_odno(r.get("odno")) for r in rows)
+            self._baseline_ready = True
         filled_changed = False
         for row in rows:
-            order = self._by_odno.get(_norm_odno(row.get("odno"))) or self._match_unknown(row)
+            order = (self._by_odno.get(_norm_odno(row.get("odno"))) or self._match_unknown(row)
+                     or self._match_external(row))
             if order is not None:
                 filled_changed |= self._apply(order, row)
 
@@ -385,6 +449,8 @@ class OrderManager:
 
     def _match_unknown(self, row: dict) -> Order | None:
         """전송 결과가 불확실했던 주문을 체결내역의 종목·방향·수량으로 찾아 연결한다."""
+        if _norm_odno(row.get("orgn_odno")):
+            return None   # 원주문번호가 있는 행 = 기존 주문의 정정·취소 기록 → 신규 주문이 아님
         odno = str(row.get("odno", "")).strip()
         side = Side.SELL if row.get("sll_buy_dvsn_cd") == "01" else Side.BUY
         for order in self.orders:
@@ -418,7 +484,8 @@ class OrderManager:
 
         if order.status is not prev_status or order.filled_qty != prev_filled:
             tag = {"FILLED": "체결", "PARTIAL": "부분체결", "CANCELED": "취소완료", "REJECTED": "거부"}
-            log.info("[%s] %s", tag.get(order.status.value, "상태변경"), order)
+            notify = order.status in (OrderStatus.FILLED, OrderStatus.PARTIAL, OrderStatus.REJECTED)
+            log.info("[%s] %s", tag.get(order.status.value, "상태변경"), order, extra={"notify": notify})
         return order.filled_qty > prev_filled
 
     async def _fetch_today_orders(self) -> list[dict]:

@@ -24,6 +24,7 @@ from pathlib import Path
 from broker.account import AccountService, AccountSnapshot
 from broker.order import Order, OrderStatus
 from core.exceptions import KisError
+from core.notifier import NOTIFY
 from market.clock import KST
 
 log = logging.getLogger(__name__)
@@ -253,6 +254,9 @@ async def settle_day(store: SettlementStore, account: AccountService, orders: li
 
     log_report(report)
     log.info("정산 저장: %s", store.report_path(trading_date))
+    log.info(f"[장 마감 정산] {report.date} 주문 {report.orders}건, 실현손익 ${report.realized_pnl:+,.2f} "
+             f"(익절 {report.wins}/손절 {report.losses}), 평가손익 ${report.unrealized_pnl:+,.2f}, "
+             f"총자산 ${report.end_equity:,.2f} ({report.return_pct:+.2f}%)", extra=NOTIFY)
     return report
 
 

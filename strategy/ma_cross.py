@@ -93,6 +93,17 @@ class MovingAverageCrossStrategy(Strategy):
         self._bars = {w.symbol: BarBuilder(params.bar_minutes) for w in watchlist}
         self._cooldown_until: dict[str, float] = {}
 
+    def add_item(self, item: WatchItem) -> None:
+        """거래일 중간에 감시 종목 추가 (예: HTS 에서 새로 산 종목의 익절·손절 감시)."""
+        if item.symbol not in self._bars:
+            self._items[item.symbol] = item
+            self._bars[item.symbol] = BarBuilder(self.p.bar_minutes)
+
+    def remove_item(self, symbol: str) -> None:
+        self._items.pop(symbol, None)
+        self._bars.pop(symbol, None)
+        self._cooldown_until.pop(symbol, None)
+
     def seed(self, symbol: str, bars: list[Bar]) -> None:
         if symbol in self._bars:
             self._bars[symbol].seed(bars)
