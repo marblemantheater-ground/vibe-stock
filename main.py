@@ -81,6 +81,21 @@ def log_snapshot(snap: AccountSnapshot) -> None:
     )
 
 
+async def log_deposit(account: AccountService, is_real: bool) -> None:
+    """예수금 상세는 참고용 → 조회 실패해도 매매는 계속한다."""
+    try:
+        d = await account.fetch_deposit()
+    except KisError as e:
+        log.warning("예수금 상세 조회 실패 (매매에는 영향 없음): %s", e)
+        return
+    log.info(f"예수금 USD: ${d.usd_deposit:,.2f}  출금가능 ${d.usd_withdrawable:,.2f} "
+             f"(익일 ${d.usd_withdrawable_next:,.2f})")
+    log.info(f"예수금 KRW: {d.krw_deposit:,.0f}원  출금가능 {d.krw_withdrawable:,.0f}원  "
+             f"총자산 {d.total_asset_krw:,.0f}원")
+    if not is_real and not d.usd_deposit:
+        log.info("  (모의투자는 이 조회에서 USD 예수금이 0으로 나옴 → 주문에는 위 주문가능 USD 를 사용)")
+
+
 class TickReporter:
     """종목별로 일정 간격마다 최신 시세를 로그로 남긴다 (틱마다 찍으면 로그 폭주)."""
 
@@ -221,6 +236,7 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
             log_snapshot(await account.refresh())
         except KisError as e:
             log.error("세션 시작 잔고 동기화 실패 (계속 진행): %s", e)
+        await log_deposit(account, client.settings.is_real)
 
         day_end = clock.trading_day_end(now)
         assert day_end is not None
@@ -309,6 +325,7 @@ async def main(argv: list[str] | None = None) -> int:
             return 1
         log.info("토큰 만료 예정: %s", client.tokens.expires_at)
         log_snapshot(snap)
+        await log_deposit(account, client.settings.is_real)
         log.info("현재 시장 상태: %s", clock.session().label)
 
         if args.stream_test:

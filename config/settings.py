@@ -28,6 +28,7 @@ _ENDPOINTS = {
 _TR_IDS: dict[str, tuple[str | None, str | None]] = {
     "overseas_balance": ("TTTS3012R", "VTTS3012R"),    # 해외주식 잔고
     "overseas_psamount": ("TTTS3007R", "VTTS3007R"),   # 해외주식 매수가능금액
+    "overseas_present_balance": ("CTRP6504R", "VTRP6504R"),  # 체결기준현재잔고 (예수금·출금가능금액)
     "overseas_buy": ("TTTT1002U", "VTTT1002U"),        # 미국 매수
     "overseas_sell": ("TTTT1006U", "VTTT1001U"),       # 미국 매도
     "overseas_nccs": ("TTTS3018R", None),              # 미체결내역 (모의 미지원)

@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 _BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-balance"
 _PSAMOUNT_PATH = "/uapi/overseas-stock/v1/trading/inquire-psamount"
+_PRESENT_BALANCE_PATH = "/uapi/overseas-stock/v1/trading/inquire-present-balance"
 _MAX_PAGES = 20
 
 
@@ -35,6 +36,17 @@ class Holding:
     eval_amount: float
     pnl_amount: float
     pnl_rate: float
+
+
+@dataclass(frozen=True)
+class DepositDetail:
+    """예수금 상세. 모의투자는 이 조회에서 USD 값이 0으로 내려온다 (주문가능금액은 psamount 기준)."""
+    usd_deposit: float             # 외화(USD) 예수금
+    usd_withdrawable: float        # 외화 출금가능금액 (오늘)
+    usd_withdrawable_next: float   # 외화 출금가능금액 (익일)
+    krw_deposit: float             # 원화 예수금
+    krw_withdrawable: float        # 원화 출금가능금액
+    total_asset_krw: float         # 총자산 (원화 환산)
 
 
 @dataclass(frozen=True)
@@ -98,6 +110,31 @@ class AccountService:
         )
         out = resp.body.get("output", {})
         return _num(out.get("ord_psbl_frcr_amt")), _num(out.get("exrt"))
+
+    async def fetch_deposit(self) -> DepositDetail:
+        """예수금·출금가능금액 상세 (해외주식 체결기준현재잔고). 체결마다 부르지 않고 시작/세션 시작 때만 조회."""
+        resp = await self._c.get(
+            _PRESENT_BALANCE_PATH,
+            self._s.tr_id("overseas_present_balance"),
+            {
+                "CANO": self._s.cano,
+                "ACNT_PRDT_CD": self._s.acnt_prdt_cd,
+                "WCRC_FRCR_DVSN_CD": "02",   # 02: 외화 기준
+                "NATN_CD": "840",            # 미국
+                "TR_MKET_CD": "00",          # 전체 시장
+                "INQR_DVSN_CD": "00",        # 전체
+            },
+        )
+        usd = next((r for r in resp.body.get("output2") or [] if r.get("crcy_cd") == "USD"), {})
+        total = resp.body.get("output3") or {}
+        return DepositDetail(
+            usd_deposit=_num(usd.get("frcr_dncl_amt_2")),
+            usd_withdrawable=_num(usd.get("frcr_drwg_psbl_amt_1")),
+            usd_withdrawable_next=_num(usd.get("nxdy_frcr_drwg_psbl_amt")),
+            krw_deposit=_num(total.get("dncl_amt")),
+            krw_withdrawable=_num(total.get("wdrw_psbl_tot_amt")),
+            total_asset_krw=_num(total.get("tot_asst_amt")),
+        )
 
     async def fetch_holdings(self) -> dict[str, Holding]:
         holdings: dict[str, Holding] = {}
