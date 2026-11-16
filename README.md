@@ -21,6 +21,9 @@ cd vibe-stock
 | 거래일 하루만 실행 후 종료 (스케줄러용) | `run.bat --once` | `./run.sh --once` |
 | N초 테스트 실행 (주문·정산 포함) | `run.bat --stream-test 60` | `./run.sh --stream-test 60` |
 | 정산 보고서 보기 | `run.bat --report` (또는 `--report 2026-11-10`) | `./run.sh --report` |
+| **긴급 정지** (미체결 취소 + 전부 매도 + 매수 중지) | `kill.bat` 더블클릭 또는 `run.bat --kill` | `./run.sh --kill` |
+| 매매 재개 (손실 한도·긴급 정지 해제) | `run.bat --resume` | `./run.sh --resume` |
+| 손실 차단 상태 보기 | `run.bat --risk-status` | `./run.sh --risk-status` |
 
 ## 구조
 
@@ -36,6 +39,7 @@ market/clock.py      미국장 세션 판별 (서머타임 자동, 휴장일 연
 market/bars.py       분봉 조회·집계
 strategy/            매매 전략 (이동평균 돌파 + 등락률 조건)
 report/settlement.py 거래일 정산 (매매내역·손익·수익률 저장)
+risk/guard.py        손실 차단 (하루 손실 한도·최대 낙폭 한도·긴급 정지)
 ```
 
 ## 정산 데이터 (`data/reports/{paper|real}/`)
@@ -48,6 +52,19 @@ report/settlement.py 거래일 정산 (매매내역·손익·수익률 저장)
 
 - 날짜는 미국 현지 거래일 기준. 실현손익은 수수료·세금 제외 추정치.
 - `data/` 는 git 에 올라가지 않으므로 Windows/macOS 각각 따로 쌓인다.
+
+## 손실 차단 (`config/strategy.toml` [risk])
+
+| 장치 | 발동 조건 (기본값) | 동작 | 해제 |
+|---|---|---|---|
+| 하루 손실 한도 | 오늘 시작 총자산 대비 -5% 가 10초 이상 | 신규 매수 중지 (익절·손절 매도는 계속) | 다음 거래일 자동 |
+| 최대 낙폭 한도 | 고점(일별 마감 총자산 최고치) 대비 -15% | 신규 매수 중지 | `--resume` |
+| 긴급 정지 | `kill.bat` / `--kill` | 미체결 전부 취소 + 보유 전부 매도 + 매수 중지 | `--resume` |
+
+- 총자산 = 주문가능 USD + 보유 평가금액(실시간 체결가). `*_action = "liquidate"` 로 바꾸면 한도 발동 시에도 전부 매도.
+- 매매 프로그램이 실행 중이면 `--kill`/`--resume` 은 몇 초 안에 반영된다. 꺼져 있으면 장중엔 그 자리에서 청산, 휴장이면 다음 실행 때 청산.
+- 상태는 `data/risk/{paper|real}.json` 에 저장되어 재시작해도 유지된다.
+- 입출금이 있으면 총자산이 달라져 한도가 잘못 발동할 수 있다 → 입출금 후 `--resume` 으로 기준점을 다시 잡는다.
 
 ## Windows ↔ macOS 공유 규칙
 

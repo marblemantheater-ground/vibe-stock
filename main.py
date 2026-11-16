@@ -13,6 +13,9 @@
     python main.py --report           # 가장 최근 정산 보고서 출력 (--report 2026-11-10 처럼 날짜 지정 가능)
     python main.py --collect-daily    # 미국 전체 종목 일봉 수집 → data/daily/ (장 마감 후 실행, 끊겨도 이어서 진행)
     python main.py --screen           # 수집한 일봉으로 그랜빌 120일선 조건 검사 → data/screen/
+    python main.py --kill             # 긴급 정지: 미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지
+    python main.py --resume           # 손실 한도·긴급 정지로 멈춘 매매 재개
+    python main.py --risk-status      # 손실 차단 상태(고점·오늘 기준 자산·중지 여부) 출력
 """
 from __future__ import annotations
 
@@ -37,6 +40,7 @@ from core.logger import setup_logging
 from core.ws_client import KisWebSocket, Tick
 from market.bars import fetch_minute_bars
 from market.clock import ET, MarketClock, Session, fmt_kst
+from risk.guard import RiskGuard, RiskParams, RiskStore, apply_command_offline, describe_state
 from market.daily import DEFAULT_DAILY_COUNT, collect_daily
 from market.universe import load_universe
 from market.watchlist import MAX_SYMBOLS, QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
@@ -246,7 +250,8 @@ class HoldingWatcher:
 
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
                         watchlist: list[WatchItem], params: MaCrossParams, order_params: OrderParams,
-                        store: SettlementStore, until: datetime | timedelta) -> None:
+                        store: SettlementStore, risk: tuple[RiskParams, RiskStore],
+                        until: datetime | timedelta) -> None:
     """until 시각까지 (timedelta 면 준비가 끝난 시점부터 그 시간 동안) 실시간 시세를 받아 전략을 실행하고 주문한다.
     거래일마다 전략·주문 관리자를 새로 만들고, 끝날 때(오류·중단 포함) 미체결 취소 후 정산한다."""
     trading_date = clock.now().astimezone(ET).date()
@@ -257,6 +262,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         await orders.load_open_orders()
     except KisError as e:
         log.warning("기존 미체결 주문 조회 실패 (계속 진행, 중복 주문 주의): %s", e)
+    guard = RiskGuard(*risk, account, orders, trading_date, order_params.order_timeout_sec)
+    await guard.start(guard.equity())
     watchlist, targets = build_trading_list(clock, watchlist, account, orders)
     strategy: Strategy = MovingAverageCrossStrategy(params, watchlist)
     ctx = AccountContext(account, orders)
@@ -288,11 +295,13 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
             if current != session:
                 log.info("세션 전환: %s → %s", session.label, current.label)
                 session = current
+            await guard.check(tradable=session is not Session.CLOSED)
             try:
                 tick = await asyncio.wait_for(ws.ticks.get(), timeout=1.0)
             except TimeoutError:
                 continue
             reporter.on_tick(tick)
+            guard.on_tick(tick.symbol, tick.price)
             orders.on_tick(tick.symbol, tick.price)
             try:
                 signals = strategy.on_tick(tick, session, ctx)
@@ -309,7 +318,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         await ws.stop()
         await asyncio.gather(ws_task, order_task, return_exceptions=True)
         log.info("실시간 시세 수신 종료 (수신 틱 %d건)", reporter.count)
-        await settle_day(store, account, orders.orders, trading_date, start_snap)
+        report = await settle_day(store, account, orders.orders, trading_date, start_snap)
+        guard.on_settled(report.end_equity if report else None)
 
 
 async def sleep_until(clock: MarketClock, target: datetime) -> None:
@@ -320,7 +330,7 @@ async def sleep_until(clock: MarketClock, target: datetime) -> None:
 
 async def run_forever(client: KisClient, account: AccountService, clock: MarketClock,
                       watchlist: list[WatchItem], params: MaCrossParams, order_params: OrderParams,
-                      store: SettlementStore, once: bool = False) -> None:
+                      store: SettlementStore, risk: tuple[RiskParams, RiskStore], once: bool = False) -> None:
     """세션 대기 → 거래일 매매 → 정산을 반복한다. once 면 거래일 하나를 마치고 반환."""
     while True:
         now = clock.now()
@@ -345,7 +355,8 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
         day_end = clock.trading_day_end(now)
         assert day_end is not None
         try:
-            await stream_quotes(client, account, clock, watchlist, params, order_params, store, until=day_end)
+            await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
+                                until=day_end)
         except Exception:
             log.exception("시세 수신 중 예기치 못한 오류 → 30초 후 재시작")
             await asyncio.sleep(30)
@@ -422,6 +433,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--limit", type=int, metavar="N", help="--collect-daily 를 앞쪽 N종목만 (테스트용)")
     p.add_argument("--screen", action="store_true",
                    help="수집한 일봉으로 종목 선정 후 종료 (--collect-daily 와 함께 쓰면 수집 → 선정 순서로 실행)")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--kill", action="store_true",
+                   help="긴급 정지: 미체결 주문 전부 취소 + 보유 종목 전부 매도 + 신규 매수 중지 (--resume 까지 유지)")
+    g.add_argument("--resume", action="store_true", help="손실 한도·긴급 정지로 멈춘 매매를 재개")
+    g.add_argument("--risk-status", action="store_true", help="손실 차단 상태 출력")
     return p.parse_args(argv)
 
 
@@ -432,16 +448,24 @@ async def main(argv: list[str] | None = None) -> int:
         watchlist = load_watchlist(_WATCHLIST_PATH)
         params = MaCrossParams.from_toml(_STRATEGY_PATH)
         order_params = OrderParams.from_toml(_STRATEGY_PATH)
+        risk_params = RiskParams.from_toml(_STRATEGY_PATH)
     except (ValueError, OSError) as e:
         print(f"[설정 오류] {e}", file=sys.stderr)
         return 2
 
     setup_logging(settings.log_dir, settings.log_level)
     store = SettlementStore(BASE_DIR / "data", settings.env)
+    risk = (risk_params, RiskStore(BASE_DIR / "data" / "risk", settings.env))
     if args.report:
         return show_report(store, args.report)
-    if not args.report:
-        setup_slack(settings.slack_webhook_url, prefix="[모의] " if not settings.is_real else "[실전] ")
+    if args.risk_status:
+        for line in describe_state(risk[1].load()):
+            log.info(line)
+        return 0
+    setup_slack(settings.slack_webhook_url, prefix="[모의] " if not settings.is_real else "[실전] ")
+    if args.kill or args.resume:
+        return await run_risk_command("kill" if args.kill else "resume", settings, MarketClock(),
+                                      order_params, store, risk)
     job_label = "일봉 수집·종목 선정" if (args.collect_daily or args.screen) else "매매"
     log.info("=== vibe-stock 시작: %s (환경: %s, 계좌: %s-**) ===", job_label, settings.env.upper(),
              settings.cano[:4] + "****", extra=NOTIFY)
@@ -463,14 +487,85 @@ async def main(argv: list[str] | None = None) -> int:
     job = "daily" if (args.collect_daily or args.screen) else "trader"
     try:
         with InstanceLock(BASE_DIR / "data" / f"{job}.{settings.env}.lock"):
-            return await run_job(args, settings, clock, watchlist, params, order_params, store)
+            return await run_job(args, settings, clock, watchlist, params, order_params, store, risk)
     except AlreadyRunning as e:
         log.error("%s → 이번 실행은 종료합니다", e)
         return 3
 
 
+async def run_risk_command(command: str, settings, clock: MarketClock, order_params: OrderParams,
+                           store: SettlementStore, risk: tuple[RiskParams, RiskStore]) -> int:
+    """--kill / --resume. 매매 프로그램이 실행 중이면 명령 파일로 전달하고, 꺼져 있으면 직접 처리한다
+    (긴급 정지는 장중이면 이 실행에서 바로 청산까지)."""
+    label = "긴급 정지" if command == "kill" else "매매 재개"
+    lock = InstanceLock(BASE_DIR / "data" / f"trader.{settings.env}.lock")
+    try:
+        lock.acquire(wait_sec=0.5)
+    except AlreadyRunning:
+        risk[1].send(command)
+        log.warning("[%s] 실행 중인 매매 프로그램에 명령 전달 → 장중이면 몇 초 안에, 장 외 시간이면 다음 세션 시작 시 처리",
+                    label, extra=NOTIFY)
+        return 0
+    try:
+        log.warning("[%s] 매매 프로그램이 꺼져 있음 → %s", label, apply_command_offline(risk[1], command),
+                    extra=NOTIFY)
+        if command == "resume":
+            return 0
+        if clock.session() is Session.CLOSED:
+            log.warning("[긴급 정지] 지금은 휴장 → 매매 프로그램을 다음에 실행하면 장이 열릴 때 청산합니다")
+            return 0
+        return await liquidate_now(settings, clock, order_params, store, risk)
+    finally:
+        lock.release()
+
+
+async def liquidate_now(settings, clock: MarketClock, order_params: OrderParams, store: SettlementStore,
+                        risk: tuple[RiskParams, RiskStore], max_sec: float = 600.0) -> int:
+    """매매 프로그램 없이 긴급 정지 청산: 미체결 전부 취소 → 보유 전부 매도 → 체결 확인 (최대 10분)."""
+    async with KisClient(settings) as client:
+        account = AccountService(client)
+        try:
+            start_snap = await bootstrap(client, account)
+        except KisError as e:
+            log.critical("[긴급 정지] 계좌 조회 실패 → 청산하지 못했습니다. HTS/앱에서 직접 정리하세요: %s", e,
+                         extra=NOTIFY)
+            return 1
+        log_snapshot(start_snap)
+        trading_date = clock.now().astimezone(ET).date()
+        orders = OrderManager(client, account, order_params)
+        try:
+            await orders.load_open_orders()
+        except KisError as e:
+            log.warning("기존 미체결 주문 조회 실패: %s", e)
+        guard = RiskGuard(*risk, account, orders, trading_date, order_params.order_timeout_sec)
+        await guard.start(guard.equity())
+        order_task = asyncio.create_task(orders.run(), name="order-sync")
+        deadline = time.monotonic() + max_sec
+        try:
+            await orders.cancel_all_open(include_adopted=True)
+            while time.monotonic() < deadline and clock.session() is not Session.CLOSED:
+                await guard.check(tradable=True)
+                if guard.liquidated:
+                    break
+                if orders.dry_run and orders.orders:
+                    log.warning("[긴급 정지] 주문 미전송 모드 → 청산 주문은 기록만 하고 종료")
+                    break
+                await asyncio.sleep(1)
+            else:
+                log.error("[긴급 정지] 시간 안에 청산을 끝내지 못했습니다. 남은 종목은 HTS/앱에서 확인하세요",
+                          extra=NOTIFY)
+        finally:
+            await orders.close()
+            order_task.cancel()
+            await asyncio.gather(order_task, return_exceptions=True)
+            report = await settle_day(store, account, orders.orders, trading_date, start_snap)
+            guard.on_settled(report.end_equity if report else None)
+    return 0
+
+
 async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchlist: list[WatchItem],
-                  params: MaCrossParams, order_params: OrderParams, store: SettlementStore) -> int:
+                  params: MaCrossParams, order_params: OrderParams, store: SettlementStore,
+                  risk: tuple[RiskParams, RiskStore]) -> int:
     if args.collect_daily:
         async with KisClient(settings) as client:
             rc = await run_collect_daily(client, clock, args.limit)
@@ -493,10 +588,10 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
         log.info("현재 시장 상태: %s", clock.session().label)
 
         if args.stream_test:
-            await stream_quotes(client, account, clock, watchlist, params, order_params, store,
+            await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
                                 until=timedelta(seconds=args.stream_test))
             return 0
-        await run_forever(client, account, clock, watchlist, params, order_params, store, once=args.once)
+        await run_forever(client, account, clock, watchlist, params, order_params, store, risk, once=args.once)
     return 0
 
 

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from broker.account import AccountService
 from core.api_client import KisClient
@@ -158,6 +159,7 @@ class OrderManager:
         self._escape_canceling: set[int] = set()       # 가격 이탈 취소를 이미 시작한 주문 (틱마다 중복 방지)
         self._seen_odnos: set[str] = set()             # 시작 시 이미 있던 오늘 주문 (외부 주문 감지에서 제외)
         self._baseline_ready = False                   # _seen_odnos 를 채웠는지 (못 채웠으면 첫 동기화 때 채움)
+        self.buy_gate: Callable[[], str | None] | None = None   # 손실 차단 장치: 매수 금지 사유 (없으면 None)
         self.dry_run = params.dry_run or (self._s.is_real and not params.allow_real_trading)
         if self._s.is_real and not params.allow_real_trading and not params.dry_run:
             log.warning("실전 계좌지만 allow_real_trading = false → 주문을 보내지 않습니다 (신호만 기록)")
@@ -198,12 +200,14 @@ class OrderManager:
         self._sync_now.set()
 
     # ── 주문 ────────────────────────────────────────────────
-    def submit(self, signal: Signal) -> Order | None:
-        """사전 검증 후 주문을 등록하고 전송은 백그라운드로 진행한다 (틱 처리를 막지 않음)."""
+    def submit(self, signal: Signal, *, force: bool = False, slippage_pct: float | None = None) -> Order | None:
+        """사전 검증 후 주문을 등록하고 전송은 백그라운드로 진행한다 (틱 처리를 막지 않음).
+        force: 손실 차단 청산 매도 → 하루 주문 건수 한도를 적용하지 않는다."""
         # 시장가 대신 현재가에서 slippage_pct 만큼 불리한 지정가 → 즉시 체결되면서 가격 상한/하한 보장
         direction = 1 if signal.side is Side.BUY else -1
-        limit = _round_price(signal.price * (1 + direction * self.p.slippage_pct / 100))
-        reason = self._precheck(signal, limit)
+        slip = self.p.slippage_pct if slippage_pct is None else slippage_pct
+        limit = _round_price(signal.price * (1 + direction * slip / 100))
+        reason = self._precheck(signal, limit, force)
         if reason:
             log.warning("[주문 보류] %s → %s", signal, reason)
             return None
@@ -221,13 +225,15 @@ class OrderManager:
         self._spawn(self._send(order), f"order-{signal.symbol}")
         return order
 
-    def _precheck(self, signal: Signal, limit: float) -> str | None:
+    def _precheck(self, signal: Signal, limit: float, force: bool = False) -> str | None:
         if signal.qty <= 0:
             return "수량 0"
+        if signal.side is Side.BUY and self.buy_gate and (blocked := self.buy_gate()):
+            return blocked
         if self.open_orders(signal.symbol):
             return "같은 종목에 미체결 주문이 있음"
         sent_today = sum(1 for o in self.orders if o.status is not OrderStatus.REJECTED and not o.adopted)
-        if sent_today >= self.p.max_orders_per_day:
+        if not force and sent_today >= self.p.max_orders_per_day:
             return f"일일 주문 한도({self.p.max_orders_per_day}건) 도달"
         snap = self._account.snapshot
         if snap is None:
