@@ -190,3 +190,48 @@ export type SettingsView = {
   file: string | null;
   groups: { title: string; fields: SettingField[] }[];
 };
+
+// 연간 정산 (/api/annual). report/annual.py 의 compute_annual 과 짝을 이룬다.
+export type AnnualSell = {
+  trade_date: string;
+  settle_date: string;
+  symbol: string;
+  qty: number;
+  price: number;
+  sell_amount: number;
+  sell_fee: number;
+  cost_usd: number;
+  gain_usd: number;
+  rate: number | null;
+  rate_source: "exact" | "near" | "current" | "none";
+  proceeds_krw: number;
+  cost_krw: number;
+  gain_krw: number;
+  note: string;
+};
+
+export type Annual = {
+  years: number[];
+  year: number;
+  env: string;
+  cost_method: "fifo" | "average";
+  params: { commission_pct: number; sec_fee_per_million: number; finra_taf_per_share: number; basic_deduction_krw: number; tax_rate_pct: number };
+  sell_count: number;
+  wins: number;
+  losses: number;
+  buy_amount: number;
+  sell_amount: number;
+  fees_usd: number;
+  gain_usd: number;
+  gain_krw: number;
+  deduction_krw: number;
+  taxable_krw: number;
+  tax_krw: number;
+  after_tax_krw: number;
+  deduction_left_krw: number;
+  filing: string;
+  monthly: { month: number; sells: number; gain_usd: number; gain_krw: number; fees_usd: number }[];
+  sells: AnnualSell[];
+  open_lots: { symbol: string; qty: number; cost_usd: number; cost_krw: number }[];
+  warnings: string[];
+};

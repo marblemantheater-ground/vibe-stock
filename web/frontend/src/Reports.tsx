@@ -1,8 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import type { DayReport, SummaryDay } from "./types";
 import { pct, tone, usd } from "./format";
+import Annual from "./Annual";
 
+// 정산 탭: 일별 / 연간·세금 (주소 #reports/annual 로 바로 열 수 있다)
 export default function Reports() {
+  const [view, setView] = useState<"daily" | "annual">(() => (location.hash === "#reports/annual" ? "annual" : "daily"));
+  const pick = (v: "daily" | "annual") => {
+    setView(v);
+    history.replaceState(null, "", v === "annual" ? "#reports/annual" : "#reports");
+  };
+  return (
+    <div className="reports">
+      <div className="seg view-switch" role="tablist" aria-label="정산 보기">
+        <button role="tab" aria-selected={view === "daily"} className={view === "daily" ? "on" : ""} onClick={() => pick("daily")}>일별</button>
+        <button role="tab" aria-selected={view === "annual"} className={view === "annual" ? "on" : ""} onClick={() => pick("annual")}>연간·세금</button>
+      </div>
+      {view === "daily" ? <DailyReports /> : <Annual />}
+    </div>
+  );
+}
+
+function DailyReports() {
   const [days, setDays] = useState<SummaryDay[] | null>(null);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -79,7 +98,7 @@ export default function Reports() {
 }
 
 // 컨테이너 실제 폭으로 그려서 글자 크기가 화면 폭에 따라 커지거나 작아지지 않게 한다
-function useWidth<T extends HTMLElement>(fallback: number) {
+export function useWidth<T extends HTMLElement>(fallback: number) {
   const ref = useRef<T>(null);
   const [w, setW] = useState(fallback);
   useEffect(() => {

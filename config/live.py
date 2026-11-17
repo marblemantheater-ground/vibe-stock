@@ -21,13 +21,14 @@ from typing import Any, Callable
 from broker.order import OrderParams
 from core.notifier import NOTIFY
 from market.clock import Session
+from report.annual import FeeParams, TaxParams
 from risk.guard import RiskParams
 from strategy.ma_cross import MaCrossParams
 
 log = logging.getLogger(__name__)
 
 _POLL_SEC = 2.0
-_SECTIONS = {"ma_cross": MaCrossParams, "order": OrderParams, "risk": RiskParams}
+_SECTIONS = {"ma_cross": MaCrossParams, "order": OrderParams, "risk": RiskParams, "fees": FeeParams, "tax": TaxParams}
 
 
 @dataclass(frozen=True)
@@ -53,7 +54,7 @@ class Field:
 _ACTION_OPTS = (("block_buys", "신규 매수만 중지"), ("liquidate", "전부 청산"))
 _SESSION_OPTS = tuple((s.value, s.label) for s in (Session.PRE, Session.REGULAR, Session.AFTER))
 
-GROUPS = ("매수 신호", "익절·손절", "자금 배분", "주문", "손실 차단", "안전 스위치")
+GROUPS = ("매수 신호", "익절·손절", "자금 배분", "주문", "손실 차단", "수수료·세금", "안전 스위치")
 
 FIELDS: tuple[Field, ...] = (
     # ── 매수 신호 ──
@@ -103,6 +104,20 @@ FIELDS: tuple[Field, ...] = (
           help="한도 초과가 이 시간 동안 이어져야 발동 (순간적인 이상 시세 무시)"),
     Field("risk", "liquidation_slippage_pct", "청산 지정가 여유", "number", "손실 차단", unit="%", min=0, max=9.9, step=0.1,
           help="청산 매도 지정가 = 현재가 − 이 비율"),
+    # ── 수수료·세금 (연간 정산 계산에만 쓰임, 매매에는 영향 없음) ──
+    Field("fees", "commission_pct", "매매 수수료", "number", "수수료·세금", unit="%", min=0, max=4.99, step=0.01,
+          help="매수·매도 금액에 각각 붙는 증권사 수수료. 등급·이벤트에 따라 다르니 실제 값으로"),
+    Field("fees", "sec_fee_per_million", "SEC 수수료 (매도)", "number", "수수료·세금", unit="USD", min=0, max=1000, step=0.1,
+          help="매도 금액 $1,000,000 당 금액 (미국 증권거래위원회 부과, 수시로 바뀜)"),
+    Field("fees", "finra_taf_per_share", "FINRA TAF (매도)", "number", "수수료·세금", unit="USD", min=0, max=1, step=0.000001,
+          help="매도 1주당 금액, 주문 1건당 상한 있음"),
+    Field("tax", "cost_method", "취득가 계산 방식", "select", "수수료·세금",
+          options=(("fifo", "선입선출"), ("average", "이동평균")),
+          help="같은 종목을 여러 번 나눠 샀을 때 어떤 매수분을 판 것으로 볼지"),
+    Field("tax", "basic_deduction_krw", "기본공제", "int", "수수료·세금", unit="원", min=0, max=100_000_000, step=10000,
+          help="해외주식 양도소득 연 250만원"),
+    Field("tax", "tax_rate_pct", "세율", "number", "수수료·세금", unit="%", min=0, max=100, step=0.1,
+          help="양도소득세 20% + 지방소득세 2%"),
     # ── 안전 스위치 (화면에서 변경 불가) ──
     Field("order", "dry_run", "주문 미전송 (신호만 기록)", "bool", "안전 스위치", apply="file"),
     Field("order", "allow_real_trading", "실전 계좌 주문 허용", "bool", "안전 스위치", apply="file"),
@@ -138,7 +153,7 @@ def _show(f: Field, v: Any) -> str:
         return "/".join(names.get(s, s) for s in v) or "없음"
     if f.options:
         return dict(f.options).get(v, str(v))
-    s = f"{v:,.4f}".rstrip("0").rstrip(".") if isinstance(v, float) else f"{v:,}"
+    s = f"{v:,.6f}".rstrip("0").rstrip(".") if isinstance(v, float) else f"{v:,}"
     return f"${s}" if f.unit == "USD" else f"{s}{f.unit}"
 
 
@@ -220,8 +235,9 @@ def patch_toml(text: str, section: str, key: str, value: Any) -> str:
                 break
             if m.group(1) == section:
                 start = i
-    if start is None:
-        raise ValueError(f"설정 파일에 [{section}] 섹션이 없습니다")
+    if start is None:   # 섹션이 없으면 파일 끝에 새로 만든다
+        body = nl.join(lines).rstrip("\r\n")
+        return f"{body}{nl}{nl}[{section}]{nl}{key} = {literal}{nl}"
     end = len(lines) if end is None else end
     for i in range(start + 1, end):
         m = key_re.match(lines[i])
@@ -253,11 +269,10 @@ def _mtime(path: Path) -> float | None:
         return None
 
 
-def load_params(path: Path) -> tuple[MaCrossParams, OrderParams, RiskParams]:
+def load_params(path: Path) -> dict[str, object]:
     with path.open("rb") as f:
         raw = tomllib.load(f)
-    return (MaCrossParams.from_dict(raw.get("ma_cross", {})), OrderParams.from_dict(raw.get("order", {})),
-            RiskParams.from_dict(raw.get("risk", {})))
+    return {s: cls.from_dict(raw.get(s, {})) for s, cls in _SECTIONS.items()}
 
 
 Listener = Callable[["LiveConfig", list[Change]], None]
@@ -266,9 +281,9 @@ Listener = Callable[["LiveConfig", list[Change]], None]
 class LiveConfig:
     """현재 적용 중인 설정. 바뀌면 등록된 listener 에게 (설정, 변경 목록)을 알린다."""
 
-    def __init__(self, path: Path, ma: MaCrossParams, order: OrderParams, risk: RiskParams):
+    def __init__(self, path: Path, params: dict[str, object]):
         self.path = path
-        self.ma, self.order, self.risk = ma, order, risk
+        self._p = dict(params)
         self._mtime = _mtime(path)
         self._bad_mtime: float | None = None
         self._next_poll = 0.0
@@ -276,10 +291,16 @@ class LiveConfig:
 
     @classmethod
     def load(cls, path: Path) -> LiveConfig:
-        return cls(path, *load_params(path))
+        return cls(path, load_params(path))
 
     def params(self, section: str):
-        return {"ma_cross": self.ma, "order": self.order, "risk": self.risk}[section]
+        return self._p[section]
+
+    ma = property(lambda self: self._p["ma_cross"])
+    order = property(lambda self: self._p["order"])
+    risk = property(lambda self: self._p["risk"])
+    fees = property(lambda self: self._p["fees"])
+    tax = property(lambda self: self._p["tax"])
 
     def subscribe(self, fn: Listener) -> Callable[[], None]:
         self._listeners.append(fn)
@@ -321,7 +342,7 @@ class LiveConfig:
         merged = {s: {fl.name: getattr(self.params(s), fl.name) for fl in fields(cls)} for s, cls in _SECTIONS.items()}
         for f, v in coerced.items():
             merged[f.section][f.key] = v
-        new = tuple(cls.from_dict(merged[s]) for s, cls in _SECTIONS.items())   # ValueError → 그대로 전달
+        new = {s: cls.from_dict(merged[s]) for s, cls in _SECTIONS.items()}   # ValueError → 그대로 전달
 
         text = self.path.read_bytes().decode("utf-8")
         for f, v in coerced.items():
@@ -337,7 +358,7 @@ class LiveConfig:
         tmp.write_bytes(text.encode("utf-8"))
         os.replace(tmp, self.path)
         self._mtime = _mtime(self.path)
-        return self._apply(*new, source=source)
+        return self._apply(new, source=source)
 
     def poll(self, force: bool = False) -> list[Change]:
         """파일이 바뀌었으면 다시 읽어 적용. 매매 루프에서 자주 불러도 된다 (2초 간격으로만 확인)."""
@@ -357,14 +378,13 @@ class LiveConfig:
                           extra=NOTIFY)
             return []
         self._mtime, self._bad_mtime = mtime, None
-        return self._apply(*new, source="설정 파일")
+        return self._apply(new, source="설정 파일")
 
-    def _apply(self, ma: MaCrossParams, order: OrderParams, risk: RiskParams, source: str) -> list[Change]:
-        changes = [Change(f, getattr(self.params(f.section), f.key), getattr(new, f.key))
+    def _apply(self, new: dict[str, object], source: str) -> list[Change]:
+        changes = [Change(f, getattr(self._p[f.section], f.key), getattr(new[f.section], f.key))
                    for f in FIELDS
-                   for new in ({"ma_cross": ma, "order": order, "risk": risk}[f.section],)
-                   if _jsonable(getattr(self.params(f.section), f.key)) != _jsonable(getattr(new, f.key))]
-        self.ma, self.order, self.risk = ma, order, risk
+                   if _jsonable(getattr(self._p[f.section], f.key)) != _jsonable(getattr(new[f.section], f.key))]
+        self._p = new
         if not changes:
             return []
         # 거래일 중이면 바로 반영되고, 장 외 시간이면 다음 세션부터 (봉 단위·이평 기간은 항상 다음 거래일부터)

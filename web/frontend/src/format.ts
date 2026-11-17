@@ -53,3 +53,10 @@ export function kstTime(iso: string | null | undefined): string {
     timeZone: "Asia/Seoul", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
   });
 }
+
+// 원 단위 그대로 (세금 계산처럼 정확한 금액이 필요할 때)
+export function won(v: number | null | undefined, opts: { sign?: boolean } = {}): string {
+  if (v == null || Number.isNaN(v)) return "–";
+  const sign = v < 0 ? "−" : opts.sign && v > 0 ? "+" : "";
+  return `${sign}${Math.round(Math.abs(v)).toLocaleString("ko-KR")}원`;
+}

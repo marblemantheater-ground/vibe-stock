@@ -287,3 +287,28 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
   .change-list li { grid-template-columns: minmax(0, 1fr) auto; }
   .change-list li .pill { grid-column: 1 / -1; justify-self: start; }
 }
+
+/* ── 연간 정산 ── */
+.view-switch { align-self: flex-start; }
+.annual-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.annual-bar select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); }
+.annual-bar .btn { margin-left: auto; text-decoration: none; }
+.notice-list { margin: 0; padding: 10px 16px 10px 32px; background: var(--warn-bg); border: 1px solid var(--warn); border-radius: 8px; font-size: 13px; display: flex; flex-direction: column; gap: 2px; }
+.tax-steps { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 16px; margin: 0; padding: 14px 16px 6px; }
+.tax-steps dt { color: var(--muted); }
+.tax-steps dd { margin: 0; text-align: right; }
+.tax-steps dt:nth-of-type(4), .tax-steps dt:nth-of-type(5) { color: var(--ink); font-weight: 600; border-top: 1px solid var(--line); padding-top: 8px; }
+.tax-steps dt:nth-of-type(4) + dd, .tax-steps dt:nth-of-type(5) + dd { border-top: 1px solid var(--line); padding-top: 8px; }
+.strong { font-weight: 700; }
+.deduction { padding: 8px 16px; display: flex; flex-direction: column; gap: 4px; }
+.tax-note { margin: 0; padding: 4px 16px 14px; }
+.warn-text { color: var(--warn); font-family: var(--font); }
+.chart .zero { stroke: var(--muted); stroke-width: 1; opacity: 0.6; }
+.chart .ref-line { stroke: var(--warn); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.chart .hit { fill: transparent; }
+.chart .hit:hover { fill: var(--ink); opacity: 0.04; }
+.chart text.strong { fill: var(--ink); font-weight: 600; }
+@media (max-width: 560px) {
+  .hide-narrow { display: none; }
+  .annual-bar .btn { margin-left: 0; }
+}

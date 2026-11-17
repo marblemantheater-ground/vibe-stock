@@ -9,7 +9,7 @@ import Settings from "./Settings";
 type Auth = "checking" | "in" | "out" | "offline";
 export type Tab = "live" | "reports" | "settings";
 
-const tabFromHash = (): Tab => (location.hash === "#reports" ? "reports" : location.hash === "#settings" ? "settings" : "live");
+const tabFromHash = (): Tab => (location.hash.startsWith("#reports") ? "reports" : location.hash === "#settings" ? "settings" : "live");
 export type Link = "connecting" | "live" | "lost";
 
 const STALE_MS = 5000;

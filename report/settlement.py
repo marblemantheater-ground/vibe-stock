@@ -10,6 +10,7 @@
 손익 기준
 - 실현손익: 매도 체결가 - 매도 주문 시점의 매입평균가 (수수료·세금 제외)
 - 총자산(추정): 주문가능 USD + 보유 평가금액. 입출금이 있던 날은 수익률이 왜곡된다.
+- 수수료·세금·원화 환산은 연간 정산(report/annual.py)에서 계산한다.
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ TRADE_FIELDS = [
 SUMMARY_FIELDS = [
     "date", "env", "orders", "filled_orders", "buy_amount", "sell_amount", "realized_pnl",
     "wins", "losses", "start_equity", "end_equity", "equity_change", "return_pct", "unrealized_pnl",
+    "exchange_rate",
 ]
 
 
@@ -93,6 +95,7 @@ class DailyReport:
     start_equity: float
     end_equity: float
     unrealized_pnl: float
+    exchange_rate: float = 0.0     # 그날 KIS 환율 (원/USD) — 연간 정산의 원화 환산에 쓴다
     holdings: list[dict] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)
 
@@ -153,6 +156,7 @@ def build_report(trading_date: date, env: str, rows: list[dict], start_equity: f
         buy_amount=buy_amount, sell_amount=sell_amount, realized_pnl=realized, wins=wins, losses=losses,
         start_equity=start_equity, end_equity=_equity(end_snap),
         unrealized_pnl=end_snap.total_pnl if end_snap else 0.0,
+        exchange_rate=end_snap.exchange_rate if end_snap else 0.0,
         holdings=holdings, trades=rows,
     )
 

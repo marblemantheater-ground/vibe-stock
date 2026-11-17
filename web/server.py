@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from config.settings import BASE_DIR
+from report.annual import FeeParams, TaxParams, available_years, compute_annual, sells_csv
 from report.settlement import SettlementStore
 from web.state import DashboardState
 
@@ -149,6 +150,30 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         if not result["ok"]:
             raise HTTPException(400, result["message"])
         return result
+
+    def annual(year: int) -> dict:
+        cfg = state.config
+        fees, tax = (cfg.fees, cfg.tax) if cfg else (FeeParams(), TaxParams())
+        snap = state.account.snapshot if state.account else None
+        return compute_annual(store, year, fees, tax, current_rate=snap.exchange_rate if snap else None)
+
+    @app.get("/api/annual")
+    async def get_annual(request: Request, year: int | None = None):
+        """연간 정산: 수수료·원화 환산·예상 세금 (설정 탭의 수수료·세금 값으로 계산)."""
+        authed(request)
+        years = available_years(store)
+        y = year or years[0]
+        if not 2000 <= y <= 2100:
+            raise HTTPException(400, "연도 범위 오류")
+        return {"years": years, **annual(y)}
+
+    @app.get("/api/annual/{year}/sells.csv")
+    async def get_annual_csv(year: int, request: Request):
+        authed(request)
+        if not 2000 <= year <= 2100:
+            raise HTTPException(400, "연도 범위 오류")
+        return Response(sells_csv(annual(year)).encode("utf-8"), media_type="text/csv; charset=utf-8",
+                        headers={"Content-Disposition": f'attachment; filename="vibe-stock-{store.env}-{year}-sells.csv"'})
 
     @app.get("/api/reports")
     async def reports(request: Request):

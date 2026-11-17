@@ -11,6 +11,7 @@
     python main.py --once             # 거래일 하루만 실행하고 정산 후 종료 (작업 스케줄러/cron 용)
     python main.py --stream-test 60   # 세션과 무관하게 60초간 실행 (신호 발생 시 주문도 나감) 후 정산
     python main.py --report           # 가장 최근 정산 보고서 출력 (--report 2026-11-10 처럼 날짜 지정 가능)
+    python main.py --annual           # 올해 연간 정산: 수수료·원화 환산·예상 양도소득세 (--annual 2026 처럼 연도 지정)
     python main.py --collect-daily    # 미국 전체 종목 일봉 수집 → data/daily/ (장 마감 후 실행, 끊겨도 이어서 진행)
     python main.py --screen           # 수집한 일봉으로 그랜빌 120일선 조건 검사 → data/screen/
     python main.py --kill             # 긴급 정지: 미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지
@@ -47,6 +48,7 @@ from risk.guard import RiskGuard, RiskParams, RiskStore, apply_command_offline, 
 from market.daily import DEFAULT_DAILY_COUNT, collect_daily
 from market.universe import load_universe
 from market.watchlist import MAX_SYMBOLS, QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
+from report.annual import available_years, compute_annual, log_annual, save_annual
 from report.settlement import SettlementStore, log_report, settle_day
 from strategy.ma_cross import MovingAverageCrossStrategy
 from strategy.screener import ScreenerParams, run_screen
@@ -430,6 +432,21 @@ async def run_screener(clock: MarketClock) -> int:
     return 0
 
 
+def show_annual(store: SettlementStore, cfg: LiveConfig, which: str) -> int:
+    if which == "latest":
+        year = available_years(store)[0]
+    else:
+        try:
+            year = int(which)
+        except ValueError:
+            log.error("연도 형식 오류 (예: --annual 2026): %s", which)
+            return 2
+    result = compute_annual(store, year, cfg.fees, cfg.tax)
+    log_annual(result)
+    log.info("매도 상세 저장: %s", save_annual(store, result))
+    return 0
+
+
 def show_report(store: SettlementStore, which: str) -> int:
     if which == "latest":
         saved = sorted(store.report_path(date.today()).parent.glob("*.json"))
@@ -461,6 +478,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--once", action="store_true", help="거래일 하루만 실행하고 정산 후 종료")
     p.add_argument("--report", nargs="?", const="latest", metavar="YYYY-MM-DD",
                    help="저장된 정산 보고서 출력 (날짜 생략 시 가장 최근)")
+    p.add_argument("--annual", nargs="?", const="latest", metavar="YYYY",
+                   help="연간 정산 (수수료·원화 환산·예상 양도소득세) 출력 후 data/reports/ 에 저장")
     p.add_argument("--collect-daily", action="store_true", help="미국 전체 종목 일봉 수집 후 종료")
     p.add_argument("--limit", type=int, metavar="N", help="--collect-daily 를 앞쪽 N종목만 (테스트용)")
     p.add_argument("--screen", action="store_true",
@@ -490,6 +509,8 @@ async def main(argv: list[str] | None = None) -> int:
     risk = (risk_params, RiskStore(BASE_DIR / "data" / "risk", settings.env))
     if args.report:
         return show_report(store, args.report)
+    if args.annual:
+        return show_annual(store, cfg, args.annual)
     if args.risk_status:
         for line in describe_state(risk[1].load()):
             log.info(line)
