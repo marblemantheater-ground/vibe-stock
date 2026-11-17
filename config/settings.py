@@ -59,6 +59,7 @@ class Settings:
     seed_access_token: str | None
     hts_id: str | None   # 체결통보 웹소켓 구독용 (선택)
     slack_webhook_url: str | None   # 슬랙 알림 (선택)
+    dashboard_password: str | None  # 대시보드 로그인 비밀번호 (비우면 실행마다 임시 비밀번호)
     seed_access_token_expires: str | None
     ref_symbol: str
     ref_exchange: str
@@ -121,6 +122,7 @@ def load_settings() -> Settings:
         seed_access_token=_optional("KIS_ACCESS_TOKEN"),
         hts_id=_optional("KIS_HTS_ID"),
         slack_webhook_url=_optional("SLACK_WEBHOOK_URL"),
+        dashboard_password=_optional("DASHBOARD_PASSWORD"),
         seed_access_token_expires=_optional("KIS_ACCESS_TOKEN_EXPIRES"),
         ref_symbol=os.getenv("KIS_REF_SYMBOL") or "AAPL",
         ref_exchange=os.getenv("KIS_REF_EXCHANGE") or "NASD",

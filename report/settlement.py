@@ -203,6 +203,21 @@ class SettlementStore:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
+    def load_summary(self) -> list[dict]:
+        """daily_summary.csv 전체 (날짜순). 숫자 칸은 float 로 변환."""
+        if not self.summary_path.exists():
+            return []
+        with self.summary_path.open(encoding=_CSV_ENCODING, newline="") as f:
+            rows = list(csv.DictReader(f))
+        text = {"date", "env"}
+        return [{k: (v if k in text else _num(v)) for k, v in r.items()} for r in sorted(rows, key=lambda r: r["date"])]
+
+    def load_report_json(self, d: date) -> dict | None:
+        try:
+            return json.loads(self.report_path(d).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
     def load_report(self, d: date) -> DailyReport | None:
         try:
             data = json.loads(self.report_path(d).read_text(encoding="utf-8"))

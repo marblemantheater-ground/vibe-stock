@@ -48,6 +48,8 @@ from report.settlement import SettlementStore, log_report, settle_day
 from strategy.base import Strategy
 from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
 from strategy.screener import ScreenerParams, run_screen
+from web.server import DashboardParams, DashboardServer
+from web.state import DashboardState
 
 log = logging.getLogger("main")
 
@@ -251,7 +253,7 @@ class HoldingWatcher:
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
                         watchlist: list[WatchItem], params: MaCrossParams, order_params: OrderParams,
                         store: SettlementStore, risk: tuple[RiskParams, RiskStore],
-                        until: datetime | timedelta) -> None:
+                        until: datetime | timedelta, dash: DashboardState | None = None) -> None:
     """until 시각까지 (timedelta 면 준비가 끝난 시점부터 그 시간 동안) 실시간 시세를 받아 전략을 실행하고 주문한다.
     거래일마다 전략·주문 관리자를 새로 만들고, 끝날 때(오류·중단 포함) 미체결 취소 후 정산한다."""
     trading_date = clock.now().astimezone(ET).date()
@@ -280,6 +282,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
     if isinstance(until, timedelta):
         until = clock.now() + until
     watcher = HoldingWatcher(client, ws, strategy, account, orders, watchlist, targets)
+    if dash:
+        dash.attach_day(trading_date, orders, guard, strategy, ws, watcher, targets, params)
     ws_task = asyncio.create_task(ws.run(), name="kis-websocket")
     order_task = asyncio.create_task(orders.run(), name="order-sync")
     reporter = TickReporter()
@@ -302,6 +306,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 continue
             reporter.on_tick(tick)
             guard.on_tick(tick.symbol, tick.price)
+            if dash:
+                dash.on_tick(tick)
             orders.on_tick(tick.symbol, tick.price)
             try:
                 signals = strategy.on_tick(tick, session, ctx)
@@ -320,6 +326,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         log.info("실시간 시세 수신 종료 (수신 틱 %d건)", reporter.count)
         report = await settle_day(store, account, orders.orders, trading_date, start_snap)
         guard.on_settled(report.end_equity if report else None)
+        if dash:
+            dash.detach_day()
 
 
 async def sleep_until(clock: MarketClock, target: datetime) -> None:
@@ -330,7 +338,8 @@ async def sleep_until(clock: MarketClock, target: datetime) -> None:
 
 async def run_forever(client: KisClient, account: AccountService, clock: MarketClock,
                       watchlist: list[WatchItem], params: MaCrossParams, order_params: OrderParams,
-                      store: SettlementStore, risk: tuple[RiskParams, RiskStore], once: bool = False) -> None:
+                      store: SettlementStore, risk: tuple[RiskParams, RiskStore], once: bool = False,
+                      dash: DashboardState | None = None) -> None:
     """세션 대기 → 거래일 매매 → 정산을 반복한다. once 면 거래일 하나를 마치고 반환."""
     while True:
         now = clock.now()
@@ -342,6 +351,8 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
             nxt = clock.next_window(now)
             log.info("현재 휴장. 다음 세션: %s (%.1f시간 후)", nxt,
                      (nxt.start - now).total_seconds() / 3600)
+            if dash:
+                dash.waiting(nxt)
             await sleep_until(clock, nxt.start)
             continue
 
@@ -356,7 +367,7 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
         assert day_end is not None
         try:
             await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
-                                until=day_end)
+                                until=day_end, dash=dash)
         except Exception:
             log.exception("시세 수신 중 예기치 못한 오류 → 30초 후 재시작")
             await asyncio.sleep(30)
@@ -587,12 +598,38 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
         await log_deposit(account, client.settings.is_real)
         log.info("현재 시장 상태: %s", clock.session().label)
 
-        if args.stream_test:
-            await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
-                                until=timedelta(seconds=args.stream_test))
-            return 0
-        await run_forever(client, account, clock, watchlist, params, order_params, store, risk, once=args.once)
+        dash, dash_server = start_dashboard(settings, clock, params, risk[0], watchlist, store, account)
+        try:
+            if args.stream_test:
+                await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
+                                    until=timedelta(seconds=args.stream_test), dash=dash)
+                return 0
+            await run_forever(client, account, clock, watchlist, params, order_params, store, risk,
+                              once=args.once, dash=dash)
+        finally:
+            if dash_server:
+                await dash_server.stop()
+                logging.getLogger().removeHandler(dash.events)
     return 0
+
+
+def start_dashboard(settings, clock: MarketClock, params: MaCrossParams, risk_params: RiskParams,
+                    watchlist: list[WatchItem], store: SettlementStore,
+                    account: AccountService) -> tuple[DashboardState | None, DashboardServer | None]:
+    """[dashboard] enabled 면 웹 화면 서버를 매매와 같은 이벤트 루프에서 띄운다."""
+    try:
+        dparams = DashboardParams.from_toml(_STRATEGY_PATH)
+    except (OSError, ValueError) as e:
+        log.warning("[dashboard] 설정 오류 → 대시보드 끔: %s", e)
+        return None, None
+    if not dparams.enabled:
+        return None, None
+    dash = DashboardState(settings.env, clock, params, risk_params, {w.symbol for w in watchlist})
+    dash.account = account
+    logging.getLogger().addHandler(dash.events)
+    server = DashboardServer(dash, store, dparams, settings.dashboard_password)
+    server.start()
+    return dash, server
 
 
 if __name__ == "__main__":

@@ -1,0 +1,219 @@
+"""대시보드 웹 서버 (FastAPI): 매매 프로그램 안에서 같이 돌며 상태를 브라우저 화면에 보낸다.
+
+- 이 PC(127.0.0.1)에서만 접속된다. 로그인 비밀번호는 .env 의 DASHBOARD_PASSWORD
+  (비어 있으면 실행할 때마다 임시 비밀번호를 만들어 콘솔 창에만 보여 준다)
+- 화면(React)은 web/dist 의 빌드 결과물을 그대로 제공한다 → 실행하는 PC 에는 Node.js 가 필요 없다
+- 1단계는 읽기 전용: 현황·보유·주문·감시 종목·이벤트(실시간 스트림), 정산 보고서
+- 웹 서버에 문제가 생겨도 매매는 계속된다 (포트 사용 중이면 대시보드만 끄고 진행)
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hmac
+import json
+import logging
+import secrets
+import socket
+import sys
+import tomllib
+from dataclasses import dataclass, fields
+from datetime import date
+from pathlib import Path
+from typing import Callable
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+
+from config.settings import BASE_DIR
+from report.settlement import SettlementStore
+from web.state import DashboardState
+
+log = logging.getLogger(__name__)
+
+DIST_DIR = BASE_DIR / "web" / "dist"
+_COOKIE = "vibe_session"
+_STREAM_INTERVAL_SEC = 1.0
+
+
+@dataclass(frozen=True)
+class DashboardParams:
+    enabled: bool = True
+    port: int = 8765
+
+    @classmethod
+    def from_toml(cls, path: Path) -> DashboardParams:
+        with path.open("rb") as f:
+            raw = tomllib.load(f).get("dashboard", {})
+        unknown = set(raw) - {f.name for f in fields(cls)}
+        if unknown:
+            raise ValueError(f"{path.name} [dashboard]: 알 수 없는 설정 {sorted(unknown)}")
+        p = cls(**raw)
+        if not 1024 <= p.port <= 65535:
+            raise ValueError("[dashboard] port 는 1024~65535 사이여야 합니다")
+        return p
+
+
+def create_app(state: DashboardState, store: SettlementStore, password: str,
+               stopping: Callable[[], bool] = lambda: False) -> FastAPI:
+    app = FastAPI(title="vibe-stock", docs_url=None, redoc_url=None, openapi_url=None)
+    sessions: set[str] = set()
+
+    def authed(request: Request) -> None:
+        if request.cookies.get(_COOKIE) not in sessions:
+            raise HTTPException(401, "로그인이 필요합니다")
+
+    @app.post("/api/login")
+    async def login(request: Request, response: Response):
+        try:
+            body = await request.json()
+        except ValueError:
+            body = {}
+        given = str(body.get("password", "")) if isinstance(body, dict) else ""
+        if not hmac.compare_digest(given.encode(), password.encode()):
+            await asyncio.sleep(1.0)   # 비밀번호 대입 속도 제한
+            log.warning("대시보드 로그인 실패")
+            raise HTTPException(401, "비밀번호가 맞지 않습니다")
+        token = secrets.token_urlsafe(32)
+        sessions.add(token)
+        response.set_cookie(_COOKIE, token, httponly=True, samesite="strict")
+        return {"ok": True}
+
+    @app.post("/api/logout")
+    async def logout(request: Request, response: Response):
+        sessions.discard(request.cookies.get(_COOKIE, ""))
+        response.delete_cookie(_COOKIE)
+        return {"ok": True}
+
+    @app.get("/api/snapshot")
+    async def snapshot(request: Request):
+        authed(request)
+        return state.snapshot()
+
+    @app.get("/api/stream")
+    async def stream(request: Request):
+        """Server-Sent Events: 1초마다 전체 상태를 보낸다 (브라우저가 끊기면 자동 재연결)."""
+        authed(request)
+
+        async def gen():
+            while not stopping() and not await request.is_disconnected():   # 종료 시작하면 스트림도 끝냄
+                if request.cookies.get(_COOKIE) not in sessions:
+                    break
+                yield f"data: {json.dumps(state.snapshot(), ensure_ascii=False)}\n\n"
+                await asyncio.sleep(_STREAM_INTERVAL_SEC)
+
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    @app.get("/api/reports")
+    async def reports(request: Request):
+        authed(request)
+        return {"env": store.env, "days": store.load_summary()}
+
+    @app.get("/api/reports/{day}")
+    async def report(day: str, request: Request):
+        authed(request)
+        try:
+            d = date.fromisoformat(day)
+        except ValueError:
+            raise HTTPException(400, "날짜 형식 오류 (예: 2026-11-10)") from None
+        data = store.load_report_json(d)
+        if data is None:
+            raise HTTPException(404, f"{day} 정산 보고서가 없습니다")
+        return data
+
+    @app.exception_handler(HTTPException)
+    async def http_error(_: Request, exc: HTTPException):
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+    # ── 화면 파일 (web/dist) ───────────────────────────────
+    @app.get("/{path:path}", include_in_schema=False)
+    async def spa(path: str):
+        target = (DIST_DIR / path).resolve()
+        if path and target.is_file() and DIST_DIR.resolve() in target.parents:
+            return FileResponse(target)
+        index = DIST_DIR / "index.html"
+        if index.exists():
+            return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<h3>화면 파일(web/dist)이 없습니다.</h3>"
+                            "<p>web/frontend 에서 <code>npm install</code> → <code>npm run build</code> 를 실행하세요.</p>",
+                            status_code=503)
+
+    return app
+
+
+class _QuietServer(uvicorn.Server):
+    """매매 프로그램의 Ctrl+C 처리를 가로채지 않도록 uvicorn 의 시그널 처리를 끈다."""
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
+
+    def install_signal_handlers(self) -> None:   # 구버전 uvicorn 호환
+        pass
+
+
+def resolve_password(configured: str | None) -> str:
+    if configured:
+        return configured
+    temp = secrets.token_urlsafe(9)
+    # 로그 파일·슬랙에 남지 않도록 콘솔 창에만 출력
+    print(f"\n[대시보드] .env 에 DASHBOARD_PASSWORD 가 없어 임시 비밀번호를 만들었습니다: {temp}\n"
+          f"           (프로그램을 다시 시작하면 바뀝니다. 고정하려면 .env 에 DASHBOARD_PASSWORD=... 추가)\n",
+          file=sys.stderr, flush=True)
+    return temp
+
+
+class DashboardServer:
+    """대시보드 실행·종료. 종료는 uvicorn 정상 종료 절차로 (강제 취소하면 Windows 에서 소켓 오류 로그가 남는다)."""
+
+    def __init__(self, state: DashboardState, store: SettlementStore, params: DashboardParams, password: str | None):
+        self._state, self._store, self._params, self._password = state, store, params, password
+        self._server: _QuietServer | None = None
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._run(), name="dashboard")
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        if self._server is not None:
+            self._server.should_exit = True
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=5)
+        except (TimeoutError, Exception):
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _run(self) -> None:
+        """실패해도 예외를 내보내지 않는다 (매매는 계속)."""
+        port = self._params.port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if sys.platform != "win32":
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+        except OSError as e:
+            sock.close()
+            log.warning("대시보드를 켜지 못했습니다 (포트 %d 사용 중?): %s → 매매는 계속합니다", port, e)
+            return
+        app = create_app(self._state, self._store, resolve_password(self._password),
+                         stopping=lambda: bool(self._server and self._server.should_exit))
+        # log_config=None: uvicorn 이 로깅 설정을 바꾸지 않고 프로그램 로그(파일·슬랙)로 남긴다
+        self._server = _QuietServer(uvicorn.Config(app, log_level="warning", log_config=None, access_log=False,
+                                                   lifespan="off", timeout_graceful_shutdown=3))
+        log.info("대시보드: http://127.0.0.1:%d (이 PC 에서만 접속)", port)
+        if not (DIST_DIR / "index.html").exists():
+            log.warning("대시보드 화면 파일(web/dist)이 없습니다 → web/frontend 에서 npm run build 필요")
+        try:
+            await self._server.serve(sockets=[sock])
+        except asyncio.CancelledError:
+            raise
+        except BaseException as e:   # uvicorn 은 시작 실패 시 SystemExit 를 던진다
+            if isinstance(e, KeyboardInterrupt):
+                raise
+            log.error("대시보드 서버 오류 → 대시보드만 중지 (매매는 계속): %r", e)
+        finally:
+            sock.close()

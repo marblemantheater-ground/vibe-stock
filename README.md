@@ -25,6 +25,24 @@ cd vibe-stock
 | 매매 재개 (손실 한도·긴급 정지 해제) | `run.bat --resume` | `./run.sh --resume` |
 | 손실 차단 상태 보기 | `run.bat --risk-status` | `./run.sh --risk-status` |
 
+## 대시보드 (브라우저 화면)
+
+매매 프로그램(`run.bat` / `./run.sh`)이 실행되는 동안 **http://127.0.0.1:8765** 에서 볼 수 있다. 이 PC 에서만 접속된다.
+
+- 로그인 비밀번호: `.env` 의 `DASHBOARD_PASSWORD` (비우면 실행할 때마다 임시 비밀번호를 콘솔 창에 표시)
+- **실시간** 탭: 총자산·오늘 손익·손실 한도 사용률, 보유 종목(익절·손절까지 거리), 오늘 주문, 최근 이벤트, 감시 종목(이동평균 추세) — 1초마다 갱신
+- **정산** 탭: 일별 총자산·실현손익 그래프, 일별 요약, 날짜별 매매 상세
+- 끄거나 포트를 바꾸려면 `config/strategy.toml` 의 `[dashboard]`
+
+화면을 고칠 때만 Node.js 가 필요하다 (실행하는 PC 에는 필요 없음):
+
+```
+cd web/frontend
+npm install
+npm run dev     # 개발 서버 http://localhost:5173 (매매 프로그램이 실행 중이어야 데이터가 보임)
+npm run build   # web/dist 갱신 → 커밋
+```
+
 ## 구조
 
 ```
@@ -40,6 +58,10 @@ market/bars.py       분봉 조회·집계
 strategy/            매매 전략 (이동평균 돌파 + 등락률 조건)
 report/settlement.py 거래일 정산 (매매내역·손익·수익률 저장)
 risk/guard.py        손실 차단 (하루 손실 한도·최대 낙폭 한도·긴급 정지)
+web/server.py        대시보드 웹 서버 (FastAPI, 127.0.0.1 전용)
+web/state.py         대시보드에 보낼 상태 모음
+web/frontend/        대시보드 화면 소스 (React + TypeScript, Vite)
+web/dist/            빌드된 화면 (커밋됨)
 ```
 
 ## 정산 데이터 (`data/reports/{paper|real}/`)

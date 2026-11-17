@@ -111,6 +111,19 @@ class MovingAverageCrossStrategy(Strategy):
     def ready(self, symbol: str) -> bool:
         return len(self._bars[symbol].closed) > self.p.long_window
 
+    def indicators(self, symbol: str) -> dict | None:
+        """화면 표시용: 마감된 봉 기준 단기·장기 이동평균과 추세(단기가 위면 up)."""
+        builder = self._bars.get(symbol)
+        if builder is None:
+            return None
+        closes = builder.closes()
+        s, l = self.p.short_window, self.p.long_window
+        ma_s = _sma(closes, s) if len(closes) >= s else None
+        ma_l = _sma(closes, l) if len(closes) >= l else None
+        trend = None if ma_s is None or ma_l is None else ("up" if ma_s > ma_l else "down")
+        return {"ma_short": ma_s, "ma_long": ma_l, "trend": trend, "bars": len(closes),
+                "ready": len(closes) > l}
+
     def on_tick(self, tick: Tick, session: Session, ctx: StrategyContext) -> list[Signal]:
         builder = self._bars.get(tick.symbol)
         if builder is None:

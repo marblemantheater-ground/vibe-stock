@@ -8,6 +8,9 @@ logs/
 *.txt
 !requirements.txt
 
+# ── 대시보드 화면 개발용 (빌드 결과 web/dist 는 커밋한다) ──
+node_modules/
+
 # ── Python ──
 __pycache__/
 *.py[cod]
