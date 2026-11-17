@@ -31,6 +31,7 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
           <nav className="tabs">
             <a href="#live" className={tab === "live" ? "on" : ""}>실시간</a>
             <a href="#reports" className={tab === "reports" ? "on" : ""}>정산</a>
+            <a href="#backtest" className={tab === "backtest" ? "on" : ""}>백테스트</a>
             <a href="#settings" className={tab === "settings" ? "on" : ""}>설정</a>
           </nav>
           <div className="status-row">

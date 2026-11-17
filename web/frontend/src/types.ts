@@ -235,3 +235,54 @@ export type Annual = {
   open_lots: { symbol: string; qty: number; cost_usd: number; cost_krw: number }[];
   warnings: string[];
 };
+
+// 백테스트 (/api/backtest). backtest/engine.py · runs.py 와 짝을 이룬다.
+export type Coverage = {
+  symbols: { symbol: string; first: string; last: string; days: number; bars: number }[];
+  first: string | null;
+  last: string | null;
+};
+
+export type BtStatus = { running: boolean; progress: number; started_at: string | null; error: string | null; last_id: string | null };
+
+export type BtTrade = {
+  symbol: string; qty: number; entry_time: string; exit_time: string; entry_price: number; exit_price: number;
+  pnl: number; pnl_pct: number; fees: number; exit: string; reason: string; hold_min: number;
+};
+
+export type BtResult = {
+  id: string;
+  created_at: string;
+  period: { start: string; end: string; days: number };
+  symbols: string[];
+  params: { start_cash: number; fill_slippage_pct: number };
+  start_cash: number;
+  end_equity: number;
+  return_pct: number;
+  benchmark_return_pct: number;
+  max_drawdown_pct: number;
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
+  realized_pnl: number;
+  unrealized_pnl: number;
+  fees: number;
+  avg_hold_min: number | null;
+  skipped: Record<string, number>;
+  by_exit: { exit: string; count: number; pnl: number }[];
+  by_symbol: { symbol: string; trades: number; wins: number; pnl: number }[];
+  equity_curve: { date: string; equity: number; benchmark: number; cash: number; positions: number }[];
+  trade_list: BtTrade[];
+  open_positions: { symbol: string; qty: number; avg_price: number; last_price: number; pnl: number }[];
+  halts: { time: string; kind: string; equity: number }[];
+  settings: Record<string, SettingValue>;
+  overrides: Record<string, SettingValue>;
+  elapsed_sec: number;
+};
+
+export type BtRunSummary = Pick<BtResult, "id" | "created_at" | "period" | "return_pct" | "benchmark_return_pct" |
+  "max_drawdown_pct" | "trades" | "win_rate" | "profit_factor" | "fees" | "realized_pnl" | "settings" | "overrides"> & { symbol_count: number };

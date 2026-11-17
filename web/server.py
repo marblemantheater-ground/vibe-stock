@@ -19,7 +19,7 @@ import socket
 import sys
 import tomllib
 from dataclasses import dataclass, fields
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable
 
@@ -27,7 +27,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
+from backtest.runs import RunStore, data_coverage, run_backtest
 from config.settings import BASE_DIR
+from market.minute import MinuteStore
 from report.annual import FeeParams, TaxParams, available_years, compute_annual, sells_csv
 from report.settlement import SettlementStore
 from web.state import DashboardState
@@ -58,9 +60,12 @@ class DashboardParams:
 
 
 def create_app(state: DashboardState, store: SettlementStore, password: str,
-               stopping: Callable[[], bool] = lambda: False) -> FastAPI:
+               stopping: Callable[[], bool] = lambda: False, data_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="vibe-stock", docs_url=None, redoc_url=None, openapi_url=None)
     sessions: set[str] = set()
+    data_dir = data_dir or BASE_DIR / "data"
+    minutes, runs = MinuteStore(data_dir / "minute"), RunStore(data_dir / "backtest")
+    bt = {"running": False, "progress": 0.0, "started_at": None, "error": None, "last_id": None}
 
     def authed(request: Request) -> None:
         if request.cookies.get(_COOKIE) not in sessions:
@@ -174,6 +179,66 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
             raise HTTPException(400, "연도 범위 오류")
         return Response(sells_csv(annual(year)).encode("utf-8"), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition": f'attachment; filename="vibe-stock-{store.env}-{year}-sells.csv"'})
+
+    # ── 백테스트 ───────────────────────────────────────────
+    @app.get("/api/backtest/data")
+    async def backtest_data(request: Request):
+        authed(request)
+        return {"coverage": await asyncio.to_thread(data_coverage, minutes), "status": bt}
+
+    @app.get("/api/backtest/status")
+    async def backtest_status(request: Request):
+        authed(request)
+        return bt
+
+    @app.post("/api/backtest")
+    async def backtest_run(request: Request):
+        """현재 설정 + 바꿔 볼 값(파일에는 쓰지 않음)으로 백테스트. 계산은 별도 스레드 (매매 루프를 막지 않게), 한 번에 하나."""
+        guarded(request)
+        if state.config is None:
+            raise HTTPException(400, "설정을 읽을 수 없어 백테스트를 할 수 없습니다")
+        if bt["running"]:
+            raise HTTPException(409, "이미 백테스트가 실행 중입니다")
+        try:
+            body = await request.json()
+            start, end = date.fromisoformat(body["start"]), date.fromisoformat(body["end"])
+            symbols = body.get("symbols") or None
+            overrides = body.get("overrides") or {}
+            if not isinstance(overrides, dict) or (symbols is not None and not isinstance(symbols, list)):
+                raise ValueError
+            cash, slip = float(body.get("start_cash", 100_000)), float(body.get("fill_slippage_pct", 0.05))
+        except (ValueError, KeyError, TypeError):
+            raise HTTPException(400, "요청 형식 오류") from None
+        bt.update(running=True, progress=0.0, started_at=datetime.now().isoformat(timespec="seconds"), error=None)
+        log.info("[대시보드] 백테스트 요청: %s ~ %s, 바꾼 값 %d개", start, end, len(overrides))
+        try:
+            result = await asyncio.to_thread(
+                run_backtest, state.config, minutes, runs, start=start, end=end, symbols=symbols, overrides=overrides,
+                start_cash=cash, fill_slippage_pct=slip, progress=lambda x: bt.__setitem__("progress", round(x, 3)))
+        except ValueError as e:
+            bt["error"] = str(e)
+            raise HTTPException(400, str(e)) from None
+        except Exception as e:
+            log.exception("백테스트 오류")
+            bt["error"] = f"백테스트 중 오류: {e!r}"
+            raise HTTPException(500, bt["error"]) from None
+        finally:
+            bt["running"] = False
+        bt["last_id"] = result["id"]
+        return result
+
+    @app.get("/api/backtest/runs")
+    async def backtest_runs(request: Request):
+        authed(request)
+        return {"runs": await asyncio.to_thread(runs.list)}
+
+    @app.get("/api/backtest/runs/{run_id}")
+    async def backtest_one(run_id: str, request: Request):
+        authed(request)
+        r = await asyncio.to_thread(runs.load, run_id)
+        if r is None:
+            raise HTTPException(404, "기록이 없습니다")
+        return r
 
     @app.get("/api/reports")
     async def reports(request: Request):

@@ -12,6 +12,8 @@
     python main.py --stream-test 60   # 세션과 무관하게 60초간 실행 (신호 발생 시 주문도 나감) 후 정산
     python main.py --report           # 가장 최근 정산 보고서 출력 (--report 2026-11-10 처럼 날짜 지정 가능)
     python main.py --annual           # 올해 연간 정산: 수수료·원화 환산·예상 양도소득세 (--annual 2026 처럼 연도 지정)
+    python main.py --collect-minute   # 백테스트용 1분봉 수집 → data/minute/ (KIS 는 최근 약 한 달치만 제공 → 매일 이어 붙임)
+    python main.py --backtest 20      # 저장된 분봉 최근 20거래일로 현재 설정 백테스트 (화면: 대시보드 백테스트 탭)
     python main.py --collect-daily    # 미국 전체 종목 일봉 수집 → data/daily/ (장 마감 후 실행, 끊겨도 이어서 진행)
     python main.py --screen           # 수집한 일봉으로 그랜빌 120일선 조건 검사 → data/screen/
     python main.py --kill             # 긴급 정지: 미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지
@@ -26,6 +28,7 @@ import asyncio
 import logging
 import sys
 import time
+import tomllib
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -48,6 +51,8 @@ from risk.guard import RiskGuard, RiskParams, RiskStore, apply_command_offline, 
 from market.daily import DEFAULT_DAILY_COUNT, collect_daily
 from market.universe import load_universe
 from market.watchlist import MAX_SYMBOLS, QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
+from backtest.runs import RunStore, run_backtest
+from market.minute import MinuteStore, collect_minutes
 from report.annual import available_years, compute_annual, log_annual, save_annual
 from report.settlement import SettlementStore, log_report, settle_day
 from strategy.ma_cross import MovingAverageCrossStrategy
@@ -396,6 +401,7 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
             await asyncio.sleep(30)
             continue
         log.info("거래일 종료 (%s)", fmt_kst(day_end))
+        await collect_after_close(client, clock, watchlist)
         if once:
             log.info("--once: 거래일 정산을 마치고 종료합니다")
             return
@@ -429,6 +435,63 @@ async def run_screener(clock: MarketClock) -> int:
         return 1
     run_screen(items, BASE_DIR / "data" / "daily", clock.last_closed_trading_day(), params,
                BASE_DIR / "data" / "screen")
+    return 0
+
+
+MINUTE_STORE = MinuteStore(BASE_DIR / "data" / "minute")
+RUN_STORE = RunStore(BASE_DIR / "data" / "backtest")
+
+
+def minute_targets(clock: MarketClock, watchlist: list[WatchItem]) -> list[WatchItem]:
+    """분봉을 모을 종목: 관심 종목 + 최근 종목 선정 결과 + 이미 모으고 있는 종목 (계속 이어 붙이도록)."""
+    day = clock.last_closed_trading_day()
+    screened = load_screen_result(BASE_DIR / "data" / "screen" / f"{day.isoformat()}.csv")
+    stored = [WatchItem(s, "NASD") for s in MINUTE_STORE.symbols()]
+    known = {w.symbol: w for w in (*stored, *screened, *watchlist)}   # 거래소 정보는 관심·선정 쪽을 우선
+    return [known[s] for s in sorted(known)]
+
+
+async def collect_after_close(client: KisClient, clock: MarketClock, watchlist: list[WatchItem]) -> None:
+    """거래일이 끝나면 백테스트용 분봉을 이어 받는다 ([backtest] collect_after_close). 실패해도 매매에는 영향 없음."""
+    try:
+        with _STRATEGY_PATH.open("rb") as f:
+            conf = tomllib.load(f).get("backtest", {})
+    except (OSError, ValueError):
+        conf = {}
+    if not conf.get("collect_after_close", True):
+        return
+    try:
+        items = minute_targets(clock, watchlist)
+        log.info("[분봉 수집] 장 마감 후 백테스트용 분봉 이어 받기: %d종목", len(items))
+        res = await collect_minutes(client, MINUTE_STORE, items, int(conf.get("collect_days", 22)))
+        log.info("[분봉 수집] 완료: +%d봉, 실패 %s", res["added"], res["failed"] or "없음")
+    except Exception:
+        log.exception("[분봉 수집] 오류 → 건너뜀 (매매에는 영향 없음)")
+
+
+def cli_backtest(cfg: LiveConfig, days: int) -> int:
+    from backtest.runs import data_coverage
+    cov = data_coverage(MINUTE_STORE)
+    if not cov["symbols"]:
+        log.error("저장된 분봉이 없습니다. 먼저 python main.py --collect-minute 을 실행하세요")
+        return 1
+    end = date.fromisoformat(cov["last"])
+    start, n = end, 1
+    while n < days and start > date.fromisoformat(cov["first"]):
+        start -= timedelta(days=1)
+        n += MarketClock.is_trading_day(start)
+    try:
+        r = run_backtest(cfg, MINUTE_STORE, RUN_STORE, start=start, end=end)
+    except ValueError as e:
+        log.error("백테스트 실패: %s", e)
+        return 1
+    log.info(f"===== 백테스트 {r['period']['start']} ~ {r['period']['end']} ({r['period']['days']}거래일, {len(r['symbols'])}종목) =====")
+    log.info(f"수익률 {r['return_pct']:+.2f}% (단순 보유 {r['benchmark_return_pct']:+.2f}%), 최대 낙폭 {r['max_drawdown_pct']:.2f}%")
+    log.info(f"거래 {r['trades']}건, 승률 {r['win_rate'] if r['win_rate'] is not None else '-'}%, "
+             f"손익비 {r['profit_factor'] or '-'}, 실현 ${r['realized_pnl']:+,.2f}, 수수료 ${r['fees']:,.2f}")
+    for e in r["by_exit"]:
+        log.info(f"  {e['exit']}: {e['count']}건 ${e['pnl']:+,.2f}")
+    log.info("결과 저장: data/backtest/%s.json (대시보드 백테스트 탭에서 비교)", r["id"])
     return 0
 
 
@@ -480,6 +543,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="저장된 정산 보고서 출력 (날짜 생략 시 가장 최근)")
     p.add_argument("--annual", nargs="?", const="latest", metavar="YYYY",
                    help="연간 정산 (수수료·원화 환산·예상 양도소득세) 출력 후 data/reports/ 에 저장")
+    p.add_argument("--collect-minute", nargs="?", const=22, type=int, metavar="DAYS",
+                   help="백테스트용 1분봉 수집 (관심·선정·이미 저장된 종목, 기본 22거래일) 후 종료")
+    p.add_argument("--backtest", nargs="?", const=20, type=int, metavar="DAYS",
+                   help="저장된 분봉의 최근 DAYS 거래일로 현재 설정 백테스트 후 종료 (기본 20)")
     p.add_argument("--collect-daily", action="store_true", help="미국 전체 종목 일봉 수집 후 종료")
     p.add_argument("--limit", type=int, metavar="N", help="--collect-daily 를 앞쪽 N종목만 (테스트용)")
     p.add_argument("--screen", action="store_true",
@@ -511,6 +578,8 @@ async def main(argv: list[str] | None = None) -> int:
         return show_report(store, args.report)
     if args.annual:
         return show_annual(store, cfg, args.annual)
+    if args.backtest:
+        return cli_backtest(cfg, args.backtest)
     if args.risk_status:
         for line in describe_state(risk[1].load()):
             log.info(line)
@@ -519,7 +588,7 @@ async def main(argv: list[str] | None = None) -> int:
     if args.kill or args.resume or args.pause:
         command = "kill" if args.kill else "pause" if args.pause else "resume"
         return await run_risk_command(command, settings, MarketClock(), order_params, store, risk)
-    job_label = "일봉 수집·종목 선정" if (args.collect_daily or args.screen) else "매매"
+    job_label = "분봉 수집" if args.collect_minute else "일봉 수집·종목 선정" if (args.collect_daily or args.screen) else "매매"
     log.info("=== vibe-stock 시작: %s (환경: %s, 계좌: %s-**) ===", job_label, settings.env.upper(),
              settings.cano[:4] + "****", extra=NOTIFY)
     if not watchlist:
@@ -537,7 +606,7 @@ async def main(argv: list[str] | None = None) -> int:
 
     clock = MarketClock()
     # 같은 작업이 겹쳐 실행되지 않게 (작업 스케줄러·더블클릭 중복 등). 매매와 일봉 수집은 서로 다른 잠금
-    job = "daily" if (args.collect_daily or args.screen) else "trader"
+    job = "daily" if (args.collect_daily or args.screen or args.collect_minute) else "trader"
     try:
         with InstanceLock(BASE_DIR / "data" / f"{job}.{settings.env}.lock"):
             return await run_job(args, settings, clock, watchlist, cfg, store, risk[1])
@@ -618,6 +687,12 @@ async def liquidate_now(settings, clock: MarketClock, order_params: OrderParams,
 
 async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchlist: list[WatchItem],
                   cfg: LiveConfig, store: SettlementStore, risk_store: RiskStore) -> int:
+    if args.collect_minute:
+        async with KisClient(settings) as client:
+            await client.tokens.get_token()
+            res = await collect_minutes(client, MINUTE_STORE, minute_targets(clock, watchlist), args.collect_minute)
+        log.info("분봉 수집 완료: %d종목, +%d봉, 실패 %s", res["symbols"], res["added"], res["failed"] or "없음")
+        return 0 if not res["failed"] else 1
     if args.collect_daily:
         async with KisClient(settings) as client:
             rc = await run_collect_daily(client, clock, args.limit)

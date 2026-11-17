@@ -8,12 +8,12 @@ type Draft = Record<string, SettingValue>;
 
 const APPLY_LABEL = { now: "바로 적용", next_day: "다음 거래일부터", file: "파일에서만" } as const;
 
-function same(a: SettingValue, b: SettingValue): boolean {
+export function same(a: SettingValue, b: SettingValue): boolean {
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => x === b[i]);
   return a === b;
 }
 
-function parse(f: SettingField, raw: SettingValue): { value?: SettingValue; error?: string } {
+export function parse(f: SettingField, raw: SettingValue): { value?: SettingValue; error?: string } {
   if (f.type === "sessions" && (raw as string[]).length === 0) return { error: "하나 이상 고르세요" };
   if (f.type !== "number" && f.type !== "int") return { value: raw };
   const s = String(raw).trim().replace(/,/g, "");
@@ -24,7 +24,7 @@ function parse(f: SettingField, raw: SettingValue): { value?: SettingValue; erro
   return { value: n };
 }
 
-function show(f: SettingField, v: SettingValue): string {
+export function show(f: SettingField, v: SettingValue): string {
   if (f.type === "bool") return v ? "켬" : "끔";
   if (f.type === "sessions") return (v as string[]).map((s) => f.options.find((o) => o.value === s)?.label ?? s).join(" / ") || "없음";
   if (f.options.length) return f.options.find((o) => o.value === v)?.label ?? String(v);
@@ -215,7 +215,7 @@ function riskNotes(changed: { f: SettingField; value: SettingValue }[]): string[
   return notes;
 }
 
-function FieldRow({ f, value, error, changed, onChange }: {
+export function FieldRow({ f, value, error, changed, onChange }: {
   f: SettingField; value: SettingValue; error?: string; changed: boolean; onChange: (v: SettingValue) => void;
 }) {
   const locked = f.apply === "file";

@@ -67,6 +67,11 @@ cost_method = "fifo"               # 취득가 계산: "fifo" 선입선출 / "av
 basic_deduction_krw = 2500000      # 기본공제 (연 250만원)
 tax_rate_pct = 22.0                # 양도소득세 20% + 지방소득세 2%
 
+[backtest]
+# 백테스트용 1분봉 (data/minute/). KIS 는 최근 약 한 달치만 주므로 매일 이어 받아 기간을 늘린다
+collect_after_close = true         # 거래일이 끝나면 관심·선정·저장 중인 종목의 분봉을 이어 받기
+collect_days = 22                  # 처음 받을 때 거슬러 올라갈 거래일 수
+
 [dashboard]
 # 매매 프로그램이 실행되는 동안 브라우저 화면 제공: http://127.0.0.1:8765 (이 PC 에서만 접속)
 # 로그인 비밀번호는 .env 의 DASHBOARD_PASSWORD

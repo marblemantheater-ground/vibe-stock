@@ -104,6 +104,7 @@ class MovingAverageCrossStrategy(Strategy):
         self._items = {w.symbol: w for w in watchlist}
         self._bars = {w.symbol: BarBuilder(params.bar_minutes) for w in watchlist}
         self._cooldown_until: dict[str, float] = {}
+        self.now = time.monotonic   # 신호 간격 계산용 시계 (백테스트는 가상 시각으로 바꿔 끼운다)
 
     def add_item(self, item: WatchItem) -> None:
         """거래일 중간에 감시 종목 추가 (예: HTS 에서 새로 산 종목의 익절·손절 감시)."""
@@ -152,7 +153,7 @@ class MovingAverageCrossStrategy(Strategy):
 
         if signal is None:
             return []
-        self._cooldown_until[tick.symbol] = time.monotonic() + self.p.cooldown_sec
+        self._cooldown_until[tick.symbol] = self.now() + self.p.cooldown_sec
         return [signal]
 
     # ── 조건 ────────────────────────────────────────────────
@@ -195,7 +196,7 @@ class MovingAverageCrossStrategy(Strategy):
 
     # ── 보조 ────────────────────────────────────────────────
     def _in_cooldown(self, symbol: str) -> bool:
-        return time.monotonic() < self._cooldown_until.get(symbol, 0.0)
+        return self.now() < self._cooldown_until.get(symbol, 0.0)
 
     def _signal(self, tick: Tick, side: Side, qty: int, reason: str) -> Signal:
         return Signal(tick.symbol, self._items[tick.symbol].exchange, side, qty, tick.price, reason)

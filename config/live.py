@@ -322,11 +322,10 @@ class LiveConfig:
         return {"groups": groups, "file": self.path.name}
 
     # ── 변경 ───────────────────────────────────────────────
-    def update(self, values: dict[str, Any], source: str = "대시보드") -> list[Change]:
-        """{"ma_cross.take_profit_pct": 4.0, ...} → 검증 → 파일 기록 → 적용. 문제가 있으면 ValueError (아무것도 안 바뀜)."""
-        self.poll(force=True)            # 파일을 직접 고친 내용이 있으면 먼저 반영
-        if not isinstance(values, dict) or not values:
-            raise ValueError("바꿀 설정이 없습니다")
+    def _validate(self, values: dict[str, Any]) -> tuple[dict[Field, Any], dict[str, object]]:
+        """현재 설정에 values 를 덮어쓴 결과를 검증한다. (실제로 바뀌는 칸, 섹션별 새 설정). 문제가 있으면 ValueError."""
+        if not isinstance(values, dict):
+            raise ValueError("설정 형식 오류")
         coerced: dict[Field, Any] = {}
         for fid, v in values.items():
             f = _BY_ID.get(fid)
@@ -337,12 +336,24 @@ class LiveConfig:
             coerced[f] = _coerce(f, v)
         # 바뀐 값만 남기고, 모두 합쳐 한꺼번에 검증 (예: 단기 < 장기)
         coerced = {f: v for f, v in coerced.items() if _jsonable(getattr(self.params(f.section), f.key)) != v}
-        if not coerced:
-            return []
         merged = {s: {fl.name: getattr(self.params(s), fl.name) for fl in fields(cls)} for s, cls in _SECTIONS.items()}
         for f, v in coerced.items():
             merged[f.section][f.key] = v
         new = {s: cls.from_dict(merged[s]) for s, cls in _SECTIONS.items()}   # ValueError → 그대로 전달
+        return coerced, new
+
+    def preview(self, values: dict[str, Any]) -> dict[str, object]:
+        """파일에 쓰지 않고 values 를 적용한 설정 (백테스트용). 화면과 같은 검증을 거친다."""
+        return self._validate(values or {})[1]
+
+    def update(self, values: dict[str, Any], source: str = "대시보드") -> list[Change]:
+        """{"ma_cross.take_profit_pct": 4.0, ...} → 검증 → 파일 기록 → 적용. 문제가 있으면 ValueError (아무것도 안 바뀜)."""
+        self.poll(force=True)            # 파일을 직접 고친 내용이 있으면 먼저 반영
+        if not isinstance(values, dict) or not values:
+            raise ValueError("바꿀 설정이 없습니다")
+        coerced, new = self._validate(values)
+        if not coerced:
+            return []
 
         text = self.path.read_bytes().decode("utf-8")
         for f, v in coerced.items():

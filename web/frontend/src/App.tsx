@@ -5,11 +5,12 @@ import Live from "./Live";
 import Reports from "./Reports";
 import Header from "./Header";
 import Settings from "./Settings";
+import Backtest from "./Backtest";
 
 type Auth = "checking" | "in" | "out" | "offline";
-export type Tab = "live" | "reports" | "settings";
+export type Tab = "live" | "reports" | "backtest" | "settings";
 
-const tabFromHash = (): Tab => (location.hash.startsWith("#reports") ? "reports" : location.hash === "#settings" ? "settings" : "live");
+const tabFromHash = (): Tab => (location.hash.startsWith("#reports") ? "reports" : location.hash === "#settings" ? "settings" : location.hash === "#backtest" ? "backtest" : "live");
 export type Link = "connecting" | "live" | "lost";
 
 const STALE_MS = 5000;
@@ -98,7 +99,7 @@ export default function App() {
   return (
     <div className="app">
       <Header snap={snap} link={link} tab={tab} onLogout={logout} />
-      <main>{tab === "live" ? snap && <Live snap={snap} /> : tab === "reports" ? <Reports /> : <Settings />}</main>
+      <main>{tab === "live" ? snap && <Live snap={snap} /> : tab === "reports" ? <Reports /> : tab === "backtest" ? <Backtest /> : <Settings />}</main>
     </div>
   );
 }

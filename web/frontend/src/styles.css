@@ -312,3 +312,46 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
   .hide-narrow { display: none; }
   .annual-bar .btn { margin-left: 0; }
 }
+
+/* ── 백테스트 ── */
+.backtest { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 16px; align-items: start; }
+.bt-main { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.bt-form { position: sticky; top: 72px; max-height: calc(100vh - 92px); }
+.bt-fields { display: flex; flex-direction: column; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.bt-fields label, .bt-label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.bt-label { flex-direction: row; align-items: center; gap: 8px; }
+.bt-range { display: flex; align-items: center; gap: 6px; }
+.bt-range input { font: inherit; font-family: var(--mono); font-size: 13px; padding: 5px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--ink); min-width: 0; flex: 1; color-scheme: inherit; }
+.bt-chips { padding: 6px 0 0; max-height: 92px; overflow-y: auto; }
+.bt-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.bt-pair .num-input input { width: 100%; }
+.panel-head.sub { background: var(--surface-2); }
+.bt-scroll { overflow-y: auto; min-height: 120px; flex: 1; }
+.bt-scroll .field { padding: 8px 16px; }
+.bt-scroll .field-help { display: none; }
+.bt-scroll .field.changed .field-help { display: inline; }
+.bt-run { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--line); }
+.bt-progress { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.bt-error { margin: 0; padding: 0 16px 12px; }
+.bt-empty { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.bt-empty p { margin: 0; }
+.bt-empty code { font-family: var(--mono); background: var(--surface-2); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; }
+.bt-head .bt-overrides { padding: 10px 16px; }
+.bt-apply { margin-left: auto; }
+.bt-note { margin: 0 16px 12px; list-style: none; padding-left: 16px; }
+.bt-skip { margin: 0; padding: 8px 16px 12px; }
+.link { border: none; background: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; font-size: 12px; font-weight: 600; }
+.legend { display: inline-flex; align-items: center; gap: 6px 14px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.lg-strategy, .lg-bench { display: inline-block; width: 14px; height: 0; border-top: 2px solid var(--accent); margin-right: 5px; vertical-align: middle; }
+.lg-bench { border-top: 2px dashed var(--idle); }
+.chart .line.bench { stroke: var(--idle); stroke-dasharray: 5 4; }
+.chart .endpoint.bench { fill: var(--idle); }
+.chart .crosshair { stroke: var(--muted); stroke-width: 1; opacity: 0.5; }
+.chart-box { position: relative; }
+.chart-tip { position: absolute; top: 8px; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+  padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2); display: flex; flex-direction: column; gap: 2px; min-width: 190px; }
+@media (max-width: 1000px) {
+  .backtest { grid-template-columns: minmax(0, 1fr); }
+  .bt-form { position: static; max-height: none; }
+  .bt-scroll { max-height: 420px; }
+}
