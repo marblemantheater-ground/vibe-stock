@@ -3,7 +3,8 @@
 - 이 PC(127.0.0.1)에서만 접속된다. 로그인 비밀번호는 .env 의 DASHBOARD_PASSWORD
   (비어 있으면 실행할 때마다 임시 비밀번호를 만들어 콘솔 창에만 보여 준다)
 - 화면(React)은 web/dist 의 빌드 결과물을 그대로 제공한다 → 실행하는 PC 에는 Node.js 가 필요 없다
-- 1단계는 읽기 전용: 현황·보유·주문·감시 종목·이벤트(실시간 스트림), 정산 보고서
+- 현황·보유·주문·감시 종목·이벤트(실시간 스트림), 정산 보고서
+- 일시정지·재개·긴급 정지, 매매 설정 변경(즉시 적용) → 로그인 + 전용 헤더가 있어야 한다
 - 웹 서버에 문제가 생겨도 매매는 계속된다 (포트 사용 중이면 대시보드만 끄고 진행)
 """
 from __future__ import annotations
@@ -106,12 +107,16 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    @app.post("/api/control/{command}")
-    async def control(command: str, request: Request):
-        """일시정지·재개·긴급 정지. 다른 사이트가 몰래 보내지 못하도록 사용자 정의 헤더를 요구한다."""
+    def guarded(request: Request) -> None:
+        """상태를 바꾸는 요청: 로그인 + 사용자 정의 헤더 (다른 사이트가 몰래 보내는 요청 차단)."""
         authed(request)
         if request.headers.get("x-vibe-control") != "1":
             raise HTTPException(403, "허용되지 않은 요청입니다")
+
+    @app.post("/api/control/{command}")
+    async def control(command: str, request: Request):
+        """일시정지·재개·긴급 정지."""
+        guarded(request)
         if command not in ("pause", "resume", "kill"):
             raise HTTPException(404, "알 수 없는 명령입니다")
         if command == "kill":
@@ -123,6 +128,27 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
                 raise HTTPException(400, "확인 문구가 맞지 않습니다")
         log.warning("[대시보드] %s 요청", {"pause": "일시정지", "resume": "재개", "kill": "긴급 정지"}[command])
         return await state.control(command)
+
+    @app.get("/api/settings")
+    async def get_settings(request: Request):
+        authed(request)
+        return state.settings_view()
+
+    @app.put("/api/settings")
+    async def put_settings(request: Request):
+        """{"values": {"ma_cross.take_profit_pct": 4.0, ...}} → 검증 → strategy.toml 기록 → 실행 중인 매매에 적용."""
+        guarded(request)
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HTTPException(400, "요청 형식 오류") from None
+        values = body.get("values") if isinstance(body, dict) else None
+        if not isinstance(values, dict):
+            raise HTTPException(400, "요청 형식 오류")
+        result = state.update_settings(values)
+        if not result["ok"]:
+            raise HTTPException(400, result["message"])
+        return result
 
     @app.get("/api/reports")
     async def reports(request: Request):

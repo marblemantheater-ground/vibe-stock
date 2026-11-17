@@ -40,13 +40,19 @@ class MaCrossParams:
     @classmethod
     def from_toml(cls, path: Path) -> MaCrossParams:
         with path.open("rb") as f:
-            raw = tomllib.load(f).get("ma_cross", {})
-        known = {f.name for f in fields(cls)}
-        unknown = set(raw) - known
+            return cls.from_dict(tomllib.load(f).get("ma_cross", {}))
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> MaCrossParams:
+        unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
-            raise ValueError(f"{path.name}: 알 수 없는 설정 {sorted(unknown)}")
+            raise ValueError(f"[ma_cross]: 알 수 없는 설정 {sorted(unknown)}")
+        raw = dict(raw)
         if "sessions" in raw:
-            raw["sessions"] = tuple(Session(s.upper()) for s in raw["sessions"])
+            try:
+                raw["sessions"] = tuple(s if isinstance(s, Session) else Session(str(s).upper()) for s in raw["sessions"])
+            except ValueError:
+                raise ValueError("sessions 는 PRE / REGULAR / AFTER 중에서 골라야 합니다") from None
         params = cls(**raw)
         params.validate()
         return params
@@ -64,6 +70,12 @@ class MaCrossParams:
             raise ValueError("capital_usage_pct 는 0~100 이어야 합니다")
         if self.max_positions < 1:
             raise ValueError("max_positions 는 1 이상이어야 합니다")
+        if not self.sessions:
+            raise ValueError("sessions 는 하나 이상 골라야 합니다")
+        if self.take_profit_pct <= 0 or self.stop_loss_pct <= 0:
+            raise ValueError("take_profit_pct, stop_loss_pct 는 0 보다 커야 합니다")
+        if self.budget_per_trade_usd <= 0 or self.cooldown_sec < 0:
+            raise ValueError("budget_per_trade_usd > 0, cooldown_sec >= 0 이어야 합니다")
 
     def with_budget_from(self, orderable_usd: float | None) -> MaCrossParams:
         """capital_usage_pct 가 켜져 있으면 주문가능 USD 로 종목당 1회 예산을 정한다.

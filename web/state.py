@@ -18,6 +18,7 @@ from risk.guard import HaltKind, RiskStore, apply_command_offline
 if TYPE_CHECKING:
     from broker.account import AccountService
     from broker.order import OrderManager
+    from config.live import LiveConfig
     from core.ws_client import KisWebSocket, Tick
     from risk.guard import RiskGuard, RiskParams
     from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
@@ -67,6 +68,7 @@ class DashboardState:
         self.risk_params = risk_params
         self.manual_symbols = manual_symbols
         self.risk_store = risk_store
+        self.config: LiveConfig | None = None   # 설정 화면 (없으면 읽기 전용)
         self.started_at = datetime.now(KST)
         self.events = EventLog()
         self.phase = "starting"            # starting / waiting / trading
@@ -100,11 +102,43 @@ class DashboardState:
         """거래일 종료: 실시간 객체만 떼고 마지막 주문 목록은 화면에 남긴다."""
         self.phase = "waiting"
         self.guard, self.strategy, self.ws, self.subscribed = None, None, None, None
+        if self.config:
+            self.ma_params = self.config.ma
 
     def on_tick(self, tick: Tick) -> None:
         self.ticks[tick.symbol] = tick
         self.tick_count += 1
         self.last_tick_at = datetime.now(KST)
+
+    def on_config(self, cfg: LiveConfig) -> None:
+        """설정이 바뀌면 화면 계산(익절·손절가, 손실 한도 게이지)에 쓰는 값도 바꾼다.
+        거래일 중 전략 값(종목당 예산 등)은 매매 루프가 따로 넣어 준다."""
+        self.risk_params = cfg.risk
+        if self.strategy is None:
+            self.ma_params = cfg.ma
+
+    def settings_view(self) -> dict:
+        if self.config is None:
+            return {"editable": False, "groups": [], "file": None}
+        self.config.poll(force=True)
+        return {"editable": True, "env": self.env, "trading": self.phase == "trading", **self.config.describe()}
+
+    def update_settings(self, values: dict) -> dict:
+        if self.config is None:
+            return {"ok": False, "message": "설정 화면을 쓸 수 없습니다"}
+        try:
+            changes = self.config.update(values)
+        except (ValueError, OSError) as e:
+            return {"ok": False, "message": str(e)}
+        if not changes:
+            return {"ok": True, "message": "바뀐 설정이 없습니다", "changes": [], **self.settings_view()}
+        later = [c for c in changes if c.field.apply != "now"]
+        msg = f"설정 {len(changes)}개를 저장했습니다. "
+        if self.phase == "trading":
+            msg += "지금 매매에 바로 적용했습니다" if not later else                 f"{len(changes) - len(later)}개는 바로 적용, {', '.join(c.field.label for c in later)}은(는) 다음 거래일부터 적용됩니다"
+        else:
+            msg += "다음 세션부터 적용됩니다"
+        return {"ok": True, "message": msg, "changes": [c.text() for c in changes], **self.settings_view()}
 
     # ── 화면에서 보낸 조작 ──────────────────────────────────
     async def control(self, command: str) -> dict:

@@ -113,10 +113,13 @@ class OrderParams:
     @classmethod
     def from_toml(cls, path: Path) -> OrderParams:
         with path.open("rb") as f:
-            raw = tomllib.load(f).get("order", {})
+            return cls.from_dict(tomllib.load(f).get("order", {}))
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> OrderParams:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
-            raise ValueError(f"{path.name} [order]: 알 수 없는 설정 {sorted(unknown)}")
+            raise ValueError(f"[order]: 알 수 없는 설정 {sorted(unknown)}")
         params = cls(**raw)
         if not 0 <= params.slippage_pct < 5:
             raise ValueError("slippage_pct 는 0 이상 5 미만이어야 합니다")
@@ -124,6 +127,8 @@ class OrderParams:
             raise ValueError("poll_interval_sec >= 1, order_timeout_sec >= poll_interval_sec 이어야 합니다")
         if params.max_buys_per_symbol < 0:
             raise ValueError("max_buys_per_symbol 은 0 이상이어야 합니다")
+        if params.max_orders_per_day < 1:
+            raise ValueError("max_orders_per_day 는 1 이상이어야 합니다")
         return params
 
 

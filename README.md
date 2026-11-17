@@ -34,6 +34,10 @@ cd vibe-stock
 - **매매 제어** 버튼: 일시정지 · 재개 · 긴급 정지 (긴급 정지는 확인 문구 `긴급정지` 입력 필요). 장 외 시간에 누르면 다음 세션 시작 때 적용
 - **실시간** 탭: 총자산·오늘 손익·손실 한도 사용률, 보유 종목(익절·손절까지 거리), 오늘 주문, 최근 이벤트, 감시 종목(이동평균 추세) — 1초마다 갱신
 - **정산** 탭: 일별 총자산·실현손익 그래프, 일별 요약, 날짜별 매매 상세
+- **설정** 탭: 매수 조건·익절·손절·자금 배분·주문·손실 한도를 바꾸면 `config/strategy.toml` 에 기록(주석 유지)되고
+  실행 중인 매매에 바로 적용된다. 봉 단위·이동평균 기간은 다음 거래일부터. 바뀐 내용은 이벤트·슬랙에 `[설정 변경]` 으로 남는다
+  - 안전 스위치(`dry_run`, `allow_real_trading`, `cancel_open_orders_on_start`)는 화면에서 바꿀 수 없다 → 파일을 직접 수정
+  - `strategy.toml` 을 직접 고쳐도 몇 초 안에 같은 방식으로 반영된다 (문법 오류면 알림만 보내고 기존 값 유지)
 - 끄거나 포트를 바꾸려면 `config/strategy.toml` 의 `[dashboard]`
 
 화면을 고칠 때만 Node.js 가 필요하다 (실행하는 PC 에는 필요 없음):
@@ -52,6 +56,7 @@ main.py              진입점 (세션 대기 → 실시간 시세 → 전략 �
 config/settings.py   KIS_ENV=paper|real 로 모의/실전 전환
 config/watchlist.csv 매매 대상 종목
 config/strategy.toml 전략·주문 설정 (실전 주문은 allow_real_trading = true 필요)
+config/live.py       설정 즉시 적용 (화면·파일 변경 → 실행 중인 매매에 반영)
 core/                토큰·REST·웹소켓·로깅
 broker/account.py    예수금·잔고 조회
 broker/order.py      주문·체결 확인·미체결 취소

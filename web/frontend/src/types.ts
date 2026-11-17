@@ -163,3 +163,30 @@ export type DayReport = {
   holdings: { symbol: string; quantity: number; avg_price: number; current_price: number; pnl_amount: number; pnl_rate: number }[];
   trades: TradeRow[];
 };
+
+// 설정 화면 (/api/settings). config/live.py 의 FIELDS 와 짝을 이룬다.
+export type SettingValue = number | boolean | string | string[];
+
+export type SettingField = {
+  id: string;
+  section: string;
+  key: string;
+  label: string;
+  type: "number" | "int" | "bool" | "select" | "sessions";
+  apply: "now" | "next_day" | "file";
+  unit: string;
+  help: string;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  options: { value: string | number; label: string }[];
+  value: SettingValue;
+};
+
+export type SettingsView = {
+  editable: boolean;
+  env?: "paper" | "real";
+  trading?: boolean;
+  file: string | null;
+  groups: { title: string; fields: SettingField[] }[];
+};

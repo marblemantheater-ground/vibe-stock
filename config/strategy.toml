@@ -1,5 +1,7 @@
 # 이동평균 돌파 + 등락률 필터 전략 설정
-# 값을 바꾸고 프로그램을 다시 시작하면 적용된다.
+# 대시보드 설정 탭에서 바꾸거나 이 파일을 직접 고치면 실행 중에도 몇 초 안에 적용된다.
+# (봉 단위·이동평균 기간과 [order] 의 dry_run / allow_real_trading / cancel_open_orders_on_start,
+#  [screener]·[dashboard] 는 다음 거래일 또는 다음 실행부터)
 
 [ma_cross]
 bar_minutes = 1            # 봉 단위(분): 1/2/3/5/10/15/30/60

@@ -75,10 +75,13 @@ class RiskParams:
     @classmethod
     def from_toml(cls, path: Path) -> RiskParams:
         with path.open("rb") as f:
-            raw = tomllib.load(f).get("risk", {})
+            return cls.from_dict(tomllib.load(f).get("risk", {}))
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> RiskParams:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
-            raise ValueError(f"{path.name} [risk]: 알 수 없는 설정 {sorted(unknown)}")
+            raise ValueError(f"[risk]: 알 수 없는 설정 {sorted(unknown)}")
         p = cls(**raw)
         if not 0 <= p.daily_loss_limit_pct < 100 or not 0 <= p.max_drawdown_pct < 100:
             raise ValueError("[risk] daily_loss_limit_pct, max_drawdown_pct 는 0 이상 100 미만이어야 합니다 (0 = 끔)")
@@ -207,6 +210,11 @@ class RiskGuard:
         self._last_liq_order: dict[str, float] = {}
         self._liq_done_logged = False
         orders.buy_gate = self.buy_block_reason
+
+    def set_params(self, params: RiskParams, order_timeout_sec: float) -> None:
+        """설정 화면·파일에서 바뀐 한도를 바로 반영 (이미 발동한 중지는 그대로 유지)."""
+        self.p = params
+        self._liq_resubmit_sec = order_timeout_sec + 5
 
     # ── 상태 ────────────────────────────────────────────────
     @property

@@ -134,7 +134,7 @@ function KillDialog({ snap, busy, onCancel, onConfirm }: { snap: Snapshot; busy:
   );
 }
 
-function Dialog({ title, danger, onCancel, children }: { title: string; danger?: boolean; onCancel: () => void; children: ReactNode }) {
+export function Dialog({ title, danger, onCancel, children }: { title: string; danger?: boolean; onCancel: () => void; children: ReactNode }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onCancel();
     window.addEventListener("keydown", onKey);

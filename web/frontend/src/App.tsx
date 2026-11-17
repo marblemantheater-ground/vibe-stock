@@ -4,9 +4,12 @@ import Login from "./Login";
 import Live from "./Live";
 import Reports from "./Reports";
 import Header from "./Header";
+import Settings from "./Settings";
 
 type Auth = "checking" | "in" | "out" | "offline";
-type Tab = "live" | "reports";
+export type Tab = "live" | "reports" | "settings";
+
+const tabFromHash = (): Tab => (location.hash === "#reports" ? "reports" : location.hash === "#settings" ? "settings" : "live");
 export type Link = "connecting" | "live" | "lost";
 
 const STALE_MS = 5000;
@@ -15,7 +18,7 @@ export default function App() {
   const [auth, setAuth] = useState<Auth>("checking");
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [link, setLink] = useState<Link>("connecting");
-  const [tab, setTab] = useState<Tab>(() => (location.hash === "#reports" ? "reports" : "live"));
+  const [tab, setTab] = useState<Tab>(tabFromHash);
   const lastMsg = useRef(0);
   const [retry, setRetry] = useState(0);
 
@@ -71,7 +74,7 @@ export default function App() {
   }, [auth, retry]);
 
   useEffect(() => {
-    const onHash = () => setTab(location.hash === "#reports" ? "reports" : "live");
+    const onHash = () => setTab(tabFromHash());
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -95,7 +98,7 @@ export default function App() {
   return (
     <div className="app">
       <Header snap={snap} link={link} tab={tab} onLogout={logout} />
-      <main>{tab === "live" ? snap && <Live snap={snap} /> : <Reports />}</main>
+      <main>{tab === "live" ? snap && <Live snap={snap} /> : tab === "reports" ? <Reports /> : <Settings />}</main>
     </div>
   );
 }

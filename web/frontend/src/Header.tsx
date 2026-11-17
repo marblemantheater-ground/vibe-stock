@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import type { Snapshot } from "./types";
-import type { Link } from "./App";
+import type { Link, Tab } from "./App";
 import { ago, kstTime, secondsSince } from "./format";
 
-type Props = { snap: Snapshot | null; link: Link; tab: "live" | "reports"; onLogout: () => void };
+type Props = { snap: Snapshot | null; link: Link; tab: Tab; onLogout: () => void };
 
 export default function Header({ snap, link, tab, onLogout }: Props) {
   const [now, setNow] = useState(Date.now());
@@ -31,6 +31,7 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
           <nav className="tabs">
             <a href="#live" className={tab === "live" ? "on" : ""}>실시간</a>
             <a href="#reports" className={tab === "reports" ? "on" : ""}>정산</a>
+            <a href="#settings" className={tab === "settings" ? "on" : ""}>설정</a>
           </nav>
           <div className="status-row">
             {s && (
