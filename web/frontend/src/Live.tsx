@@ -1,11 +1,13 @@
 import { useState, type ReactNode } from "react";
 import type { Order, Position, Risk, Snapshot, Watch } from "./types";
 import { krw, num, pct, tone, usd } from "./format";
+import Controls from "./Controls";
 
 export default function Live({ snap }: { snap: Snapshot }) {
   const a = snap.account;
   return (
     <div className="live">
+      <Controls snap={snap} />
       <section className="kpis">
         <Kpi label="총자산" value={usd(a?.equity)} sub={a ? `${krw(a.equity_krw)} · 환율 ${num(a.exchange_rate, 2)}` : ""} />
         <Kpi label="오늘 손익" value={usd(a?.day_pnl, { sign: true })} tone={tone(a?.day_pnl)}

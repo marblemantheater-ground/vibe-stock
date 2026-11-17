@@ -6,8 +6,10 @@
    → 그날 신규 매수 중지 (다음 거래일 자동 해제)
 2) 최대 낙폭 한도: 고점(일별 마감 총자산의 최고치) 대비 max_drawdown_pct% 이상 하락하면 발동
    → 사용자가 해제(--resume)할 때까지 신규 매수 중지 (재시작해도 유지)
-3) 긴급 정지: python main.py --kill (kill.bat)
+3) 긴급 정지: python main.py --kill (kill.bat, 대시보드 버튼)
    → 미체결 주문 전부 취소 + 보유 종목 전부 매도 + 신규 매수 중지 (해제할 때까지 유지)
+4) 일시정지: python main.py --pause (대시보드 버튼)
+   → 신규 매수만 중지, 매도는 계속 (재개할 때까지 유지)
 
 발동 시 동작(action)
   "block_buys": 신규 매수만 막는다. 익절·손절·데드크로스 매도는 계속 동작해 보유 종목을 지킨다.
@@ -46,17 +48,19 @@ _WARN_RATIO = 0.5             # 한도의 절반에 도달하면 미리 알림
 
 
 class HaltKind(str, Enum):
+    PAUSE = "PAUSE"
     DAILY_LOSS = "DAILY_LOSS"
     MAX_DRAWDOWN = "MAX_DRAWDOWN"
     KILL = "KILL"
 
     @property
     def label(self) -> str:
-        return {"DAILY_LOSS": "하루 손실 한도", "MAX_DRAWDOWN": "최대 낙폭 한도", "KILL": "긴급 정지"}[self.value]
+        return {"PAUSE": "일시정지", "DAILY_LOSS": "하루 손실 한도", "MAX_DRAWDOWN": "최대 낙폭 한도",
+                "KILL": "긴급 정지"}[self.value]
 
     @property
     def severity(self) -> int:
-        return {"DAILY_LOSS": 1, "MAX_DRAWDOWN": 2, "KILL": 3}[self.value]
+        return {"PAUSE": 0, "DAILY_LOSS": 1, "MAX_DRAWDOWN": 2, "KILL": 3}[self.value]
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,8 @@ class RiskParams:
     def action_for(self, kind: HaltKind) -> str:
         if kind is HaltKind.KILL:
             return "liquidate"
+        if kind is HaltKind.PAUSE:
+            return "block_buys"
         return self.daily_loss_action if kind is HaltKind.DAILY_LOSS else self.max_drawdown_action
 
 
@@ -96,7 +102,7 @@ class RiskStore:
 
     def __init__(self, root: Path, env: str):
         self.path = root / f"{env}.json"
-        self._flags = {"kill": root / f"{env}.kill", "resume": root / f"{env}.resume"}
+        self._flags = {"kill": root / f"{env}.kill", "pause": root / f"{env}.pause", "resume": root / f"{env}.resume"}
 
     def load(self) -> dict:
         try:
@@ -146,6 +152,13 @@ def apply_command_offline(store: RiskStore, command: str) -> str:
                          "day": state.get("day")}
         store.save(state)
         return "긴급 정지 상태로 저장했습니다"
+    if command == "pause":
+        if halt:
+            return f"이미 매매 중지 상태입니다 ({HaltKind(halt['kind']).label})"
+        state["halt"] = {"kind": HaltKind.PAUSE.value, "reason": "사용자 일시정지", "since": _now_text(),
+                         "day": state.get("day")}
+        store.save(state)
+        return "일시정지 상태로 저장했습니다 (신규 매수 중지)"
     if not halt:
         return "해제할 매매 중지 상태가 없습니다"
     kind = HaltKind(halt["kind"])
@@ -155,7 +168,7 @@ def apply_command_offline(store: RiskStore, command: str) -> str:
     elif kind is HaltKind.DAILY_LOSS:
         state["day_start_equity"] = None   # 다음 시작 때의 총자산을 오늘 기준점으로
     store.save(state)
-    return f"{kind.label} 중지를 해제했습니다"
+    return "일시정지를 해제했습니다" if kind is HaltKind.PAUSE else f"{kind.label} 중지를 해제했습니다"
 
 
 def describe_state(state: dict) -> list[str]:
@@ -244,6 +257,8 @@ class RiskGuard:
             log.warning("[손실 차단] 이전 매매 중지 상태 유지: %s → 해제하려면 run.bat --resume",
                         self.buy_block_reason(), extra=NOTIFY)
         await self._consume_commands_async()   # 꺼져 있는 동안 도착한 명령
+        if self.halt and self.p.action_for(self.halt_kind) == "liquidate":
+            await self._orders.cancel_all_open(include_adopted=True)   # 청산 매도가 막히지 않게
 
     def on_settled(self, end_equity: float | None) -> None:
         """장 마감 정산 후: 마감 총자산이 고점보다 높으면 고점 갱신."""
@@ -316,19 +331,21 @@ class RiskGuard:
                 await self.trigger(kind, f"{text}, 한도 {limit:g}%")
 
     # ── 발동 · 해제 ─────────────────────────────────────────
-    async def trigger(self, kind: HaltKind, reason: str) -> None:
+    async def trigger(self, kind: HaltKind, reason: str) -> bool:
+        """매매 중지 발동. 이미 같거나 더 높은 단계로 중지 중이면 아무것도 하지 않고 False."""
         if self.halt and self.halt_kind.severity >= kind.severity:
-            if kind is HaltKind.KILL:
-                log.info("[긴급 정지] 이미 긴급 정지 상태입니다")
-            return
+            if kind in (HaltKind.KILL, HaltKind.PAUSE):
+                log.info("[%s] 이미 %s 상태입니다", kind.label, self.halt_kind.label)
+            return False
         self.state["halt"] = {"kind": kind.value, "reason": reason, "since": _now_text(), "day": self._today}
         self._save()
         self._breach_since.clear()
         self._liq_done_logged = False
         action = self.p.action_for(kind)
-        until = "오늘 장 마감까지" if kind is HaltKind.DAILY_LOSS else "run.bat --resume 으로 해제할 때까지"
+        until = "오늘 장 마감까지" if kind is HaltKind.DAILY_LOSS else "재개(--resume)할 때까지"
         what = "미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지" if action == "liquidate" else "신규 매수 중지 (매도는 계속)"
-        log.error("[%s 발동] %s → %s, %s", kind.label, reason, what, until, extra=NOTIFY)
+        level = logging.WARNING if kind is HaltKind.PAUSE else logging.ERROR
+        log.log(level, "[%s 발동] %s → %s, %s", kind.label, reason, what, until, extra=NOTIFY)
 
         if action == "liquidate":
             await self._orders.cancel_all_open(include_adopted=True)
@@ -337,6 +354,7 @@ class RiskGuard:
             for o in self._orders.open_orders():
                 if o.side is Side.BUY and not o.adopted:
                     await self._orders.cancel(o)
+        return True
 
     def resume(self) -> None:
         if not self.halt:
@@ -352,15 +370,19 @@ class RiskGuard:
         self._save()
         self._breach_since.clear()
         self._warned.clear()
-        extra = f" (기준 총자산을 현재 ${eq:,.2f} 로 재설정)" if eq and kind is not HaltKind.KILL else ""
+        extra = (f" (기준 총자산을 현재 ${eq:,.2f} 로 재설정)"
+                 if eq and kind in (HaltKind.DAILY_LOSS, HaltKind.MAX_DRAWDOWN) else "")
         log.warning("[손실 차단 해제] %s 중지 해제 → 매매 재개%s", kind.label, extra, extra=NOTIFY)
 
     async def _consume_commands_async(self) -> None:
         cmds = self._store.take_commands()
         if "kill" in cmds:
             await self.trigger(HaltKind.KILL, "사용자 긴급 정지 명령")
-        elif "resume" in cmds:
+            return
+        if "resume" in cmds:
             self.resume()
+        if "pause" in cmds:
+            await self.trigger(HaltKind.PAUSE, "사용자 일시정지")
 
     # ── 청산 ────────────────────────────────────────────────
     async def _liquidate_step(self, now: float) -> None:

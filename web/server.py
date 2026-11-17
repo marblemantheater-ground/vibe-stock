@@ -106,6 +106,24 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    @app.post("/api/control/{command}")
+    async def control(command: str, request: Request):
+        """일시정지·재개·긴급 정지. 다른 사이트가 몰래 보내지 못하도록 사용자 정의 헤더를 요구한다."""
+        authed(request)
+        if request.headers.get("x-vibe-control") != "1":
+            raise HTTPException(403, "허용되지 않은 요청입니다")
+        if command not in ("pause", "resume", "kill"):
+            raise HTTPException(404, "알 수 없는 명령입니다")
+        if command == "kill":
+            try:
+                body = await request.json()
+            except ValueError:
+                body = {}
+            if not isinstance(body, dict) or body.get("confirm") != "긴급정지":
+                raise HTTPException(400, "확인 문구가 맞지 않습니다")
+        log.warning("[대시보드] %s 요청", {"pause": "일시정지", "resume": "재개", "kill": "긴급 정지"}[command])
+        return await state.control(command)
+
     @app.get("/api/reports")
     async def reports(request: Request):
         authed(request)

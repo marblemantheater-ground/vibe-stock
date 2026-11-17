@@ -167,6 +167,36 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
 .chart .pnl-bar.tone-flat { fill: var(--idle); }
 .chart .pnl-bar.sel { opacity: 1; stroke: var(--ink); stroke-width: 1; }
 
+/* ── 매매 제어 ── */
+.controls { position: relative; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 16px; }
+.control-state { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; min-width: 0; }
+.state-pill { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 15px; }
+.state-pill i { width: 10px; height: 10px; border-radius: 50%; background: currentColor; }
+.state-pill.tone-good { color: var(--good); }
+.state-pill.tone-warn { color: var(--warn); }
+.state-pill.tone-bad { color: var(--bad); }
+.control-buttons { display: flex; gap: 8px; }
+.btn.danger { color: var(--bad); border-color: var(--bad); background: transparent; }
+.btn.danger:hover:not(:disabled) { background: var(--bad-bg); }
+.btn.danger.solid { background: var(--bad); color: #fff; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.toast { position: absolute; right: 12px; top: calc(100% + 8px); z-index: 4; max-width: min(460px, calc(100% - 24px));
+  padding: 10px 14px; border-radius: 8px; font-size: 13px; cursor: pointer; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25); }
+.toast.ok { background: var(--good-bg); color: var(--ink); border: 1px solid var(--good); }
+.toast.fail { background: var(--bad-bg); color: var(--ink); border: 1px solid var(--bad); }
+.backdrop { position: fixed; inset: 0; z-index: 20; background: rgba(5, 8, 12, 0.55); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.dialog { width: min(460px, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px;
+  display: flex; flex-direction: column; gap: 10px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); }
+.dialog.danger { border-top: 4px solid var(--bad); }
+.dialog h3 { margin: 0; font-size: 17px; }
+.dialog p { margin: 0; }
+.dialog input { font: inherit; padding: 9px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--ink); }
+.dialog input:focus { outline: 2px solid var(--bad); outline-offset: 1px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+.kill-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.warn-box { background: var(--bad-bg); color: var(--bad); border-radius: 6px; padding: 8px 12px; font-weight: 600; }
+
 /* ── 버튼 · 로그인 ── */
 .btn { border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 6px; padding: 7px 14px; cursor: pointer; font-weight: 600; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }

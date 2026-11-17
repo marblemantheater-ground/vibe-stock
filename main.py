@@ -14,7 +14,8 @@
     python main.py --collect-daily    # 미국 전체 종목 일봉 수집 → data/daily/ (장 마감 후 실행, 끊겨도 이어서 진행)
     python main.py --screen           # 수집한 일봉으로 그랜빌 120일선 조건 검사 → data/screen/
     python main.py --kill             # 긴급 정지: 미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지
-    python main.py --resume           # 손실 한도·긴급 정지로 멈춘 매매 재개
+    python main.py --pause            # 일시정지: 신규 매수만 중지 (매도는 계속)
+    python main.py --resume           # 손실 한도·긴급 정지·일시정지로 멈춘 매매 재개
     python main.py --risk-status      # 손실 차단 상태(고점·오늘 기준 자산·중지 여부) 출력
 """
 from __future__ import annotations
@@ -447,7 +448,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--kill", action="store_true",
                    help="긴급 정지: 미체결 주문 전부 취소 + 보유 종목 전부 매도 + 신규 매수 중지 (--resume 까지 유지)")
-    g.add_argument("--resume", action="store_true", help="손실 한도·긴급 정지로 멈춘 매매를 재개")
+    g.add_argument("--pause", action="store_true", help="일시정지: 신규 매수만 중지 (매도는 계속, --resume 까지 유지)")
+    g.add_argument("--resume", action="store_true", help="손실 한도·긴급 정지·일시정지로 멈춘 매매를 재개")
     g.add_argument("--risk-status", action="store_true", help="손실 차단 상태 출력")
     return p.parse_args(argv)
 
@@ -474,9 +476,9 @@ async def main(argv: list[str] | None = None) -> int:
             log.info(line)
         return 0
     setup_slack(settings.slack_webhook_url, prefix="[모의] " if not settings.is_real else "[실전] ")
-    if args.kill or args.resume:
-        return await run_risk_command("kill" if args.kill else "resume", settings, MarketClock(),
-                                      order_params, store, risk)
+    if args.kill or args.resume or args.pause:
+        command = "kill" if args.kill else "pause" if args.pause else "resume"
+        return await run_risk_command(command, settings, MarketClock(), order_params, store, risk)
     job_label = "일봉 수집·종목 선정" if (args.collect_daily or args.screen) else "매매"
     log.info("=== vibe-stock 시작: %s (환경: %s, 계좌: %s-**) ===", job_label, settings.env.upper(),
              settings.cano[:4] + "****", extra=NOTIFY)
@@ -508,7 +510,7 @@ async def run_risk_command(command: str, settings, clock: MarketClock, order_par
                            store: SettlementStore, risk: tuple[RiskParams, RiskStore]) -> int:
     """--kill / --resume. 매매 프로그램이 실행 중이면 명령 파일로 전달하고, 꺼져 있으면 직접 처리한다
     (긴급 정지는 장중이면 이 실행에서 바로 청산까지)."""
-    label = "긴급 정지" if command == "kill" else "매매 재개"
+    label = {"kill": "긴급 정지", "pause": "일시정지", "resume": "매매 재개"}[command]
     lock = InstanceLock(BASE_DIR / "data" / f"trader.{settings.env}.lock")
     try:
         lock.acquire(wait_sec=0.5)
@@ -520,7 +522,7 @@ async def run_risk_command(command: str, settings, clock: MarketClock, order_par
     try:
         log.warning("[%s] 매매 프로그램이 꺼져 있음 → %s", label, apply_command_offline(risk[1], command),
                     extra=NOTIFY)
-        if command == "resume":
+        if command != "kill":
             return 0
         if clock.session() is Session.CLOSED:
             log.warning("[긴급 정지] 지금은 휴장 → 매매 프로그램을 다음에 실행하면 장이 열릴 때 청산합니다")
@@ -598,7 +600,7 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
         await log_deposit(account, client.settings.is_real)
         log.info("현재 시장 상태: %s", clock.session().label)
 
-        dash, dash_server = start_dashboard(settings, clock, params, risk[0], watchlist, store, account)
+        dash, dash_server = start_dashboard(settings, clock, params, risk[0], risk[1], watchlist, store, account)
         try:
             if args.stream_test:
                 await stream_quotes(client, account, clock, watchlist, params, order_params, store, risk,
@@ -614,7 +616,7 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
 
 
 def start_dashboard(settings, clock: MarketClock, params: MaCrossParams, risk_params: RiskParams,
-                    watchlist: list[WatchItem], store: SettlementStore,
+                    risk_store: RiskStore, watchlist: list[WatchItem], store: SettlementStore,
                     account: AccountService) -> tuple[DashboardState | None, DashboardServer | None]:
     """[dashboard] enabled 면 웹 화면 서버를 매매와 같은 이벤트 루프에서 띄운다."""
     try:
@@ -624,7 +626,7 @@ def start_dashboard(settings, clock: MarketClock, params: MaCrossParams, risk_pa
         return None, None
     if not dparams.enabled:
         return None, None
-    dash = DashboardState(settings.env, clock, params, risk_params, {w.symbol for w in watchlist})
+    dash = DashboardState(settings.env, clock, params, risk_params, {w.symbol for w in watchlist}, risk_store)
     dash.account = account
     logging.getLogger().addHandler(dash.events)
     server = DashboardServer(dash, store, dparams, settings.dashboard_password)

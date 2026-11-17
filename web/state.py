@@ -11,7 +11,9 @@ from datetime import datetime
 from itertools import count
 from typing import TYPE_CHECKING
 
+from core.notifier import NOTIFY
 from market.clock import KST, MarketClock, SessionWindow
+from risk.guard import HaltKind, RiskStore, apply_command_offline
 
 if TYPE_CHECKING:
     from broker.account import AccountService
@@ -21,6 +23,7 @@ if TYPE_CHECKING:
     from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
 
 _LOG_KEEP = 300
+log = logging.getLogger(__name__)
 
 
 class EventLog(logging.Handler):
@@ -32,7 +35,7 @@ class EventLog(logging.Handler):
         self._ids = count(1)
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name.startswith(("httpx", "httpcore", "uvicorn", "web.")):
+        if record.name.startswith(("httpx", "httpcore", "uvicorn")):
             return False
         if record.levelno >= logging.WARNING or getattr(record, "notify", False):
             return True
@@ -57,12 +60,13 @@ def _r(v: float | None, n: int = 2) -> float | None:
 
 class DashboardState:
     def __init__(self, env: str, clock: MarketClock, ma_params: MaCrossParams, risk_params: RiskParams,
-                 manual_symbols: set[str]):
+                 manual_symbols: set[str], risk_store: RiskStore | None = None):
         self.env = env
         self.clock = clock
         self.ma_params = ma_params
         self.risk_params = risk_params
         self.manual_symbols = manual_symbols
+        self.risk_store = risk_store
         self.started_at = datetime.now(KST)
         self.events = EventLog()
         self.phase = "starting"            # starting / waiting / trading
@@ -101,6 +105,37 @@ class DashboardState:
         self.ticks[tick.symbol] = tick
         self.tick_count += 1
         self.last_tick_at = datetime.now(KST)
+
+    # ── 화면에서 보낸 조작 ──────────────────────────────────
+    async def control(self, command: str) -> dict:
+        """일시정지(pause) / 재개(resume) / 긴급 정지(kill).
+        거래일 중이면 손실 차단 장치에 바로 적용, 장 외 시간이면 상태 파일에 저장 → 다음 세션 시작 시 적용."""
+        label = {"kill": "긴급 정지", "pause": "일시정지", "resume": "재개"}[command]
+        if self.guard:
+            before = self.guard.halt_kind
+            if command == "kill":
+                changed = await self.guard.trigger(HaltKind.KILL, "대시보드에서 긴급 정지")
+            elif command == "pause":
+                changed = await self.guard.trigger(HaltKind.PAUSE, "대시보드에서 일시정지")
+            else:
+                changed = before is not None
+                self.guard.resume()
+            if not changed:
+                cur = self.guard.halt_kind
+                msg = f"이미 {cur.label} 상태입니다" if cur else "매매 중지 상태가 아닙니다"
+                return {"ok": False, "message": msg}
+            msg = {"kill": "긴급 정지했습니다. 미체결 취소와 보유 종목 매도를 진행합니다",
+                   "pause": "일시정지했습니다. 신규 매수를 멈추고 매도는 계속합니다",
+                   "resume": ("일시정지를 해제하고 매매를 재개했습니다" if before is HaltKind.PAUSE
+                              else f"{before.label if before else ''} 중지를 해제하고 매매를 재개했습니다")}[command]
+            return {"ok": True, "message": msg}
+        if self.risk_store is None:
+            return {"ok": False, "message": "손실 차단 상태 파일을 쓸 수 없습니다"}
+        result = apply_command_offline(self.risk_store, command)
+        later = " 다음 세션이 시작되면 청산합니다." if command == "kill" else ""
+        log.warning("[대시보드 %s] 장 외 시간 → %s.%s", label, result, later, extra=NOTIFY)
+        ok = not result.startswith(("이미", "해제할"))
+        return {"ok": ok, "message": result + "." + later}
 
     # ── 화면용 JSON ────────────────────────────────────────
     def snapshot(self) -> dict:
@@ -163,12 +198,12 @@ class DashboardState:
         out = {"daily_limit_pct": p.daily_loss_limit_pct, "max_drawdown_pct": p.max_drawdown_pct,
                "daily_action": p.daily_loss_action, "drawdown_action": p.max_drawdown_action,
                "halt": None, "daily_loss_pct": None, "drawdown_pct": None, "peak_equity": None}
+        state = self.guard.state if self.guard else (self.risk_store.load() if self.risk_store else {})
+        if (halt := state.get("halt")):
+            out["halt"] = {"kind": halt["kind"], "label": HaltKind(halt["kind"]).label,
+                           "reason": halt.get("reason", ""), "since": halt.get("since", "")}
         if not self.guard:
             return out
-        state = self.guard.state
-        if (halt := state.get("halt")):
-            out["halt"] = {"kind": halt["kind"], "label": self.guard.halt_kind.label,
-                           "reason": halt.get("reason", ""), "since": halt.get("since", "")}
         eq = self.guard.equity()
         start, peak = state.get("day_start_equity"), state.get("peak_equity")
         out["peak_equity"] = _r(peak)

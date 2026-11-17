@@ -59,7 +59,7 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
         <div className="halt-banner" role="alert">
           <strong>매매 중지 · {halt.label}</strong>
           <span>{halt.reason}</span>
-          <span className="muted">{kstTime(halt.since)} 부터 · 해제: run.bat --resume</span>
+          <span className="muted">{kstTime(halt.since)} 부터 · 해제: 실시간 탭의 재개 버튼</span>
         </div>
       )}
     </>
