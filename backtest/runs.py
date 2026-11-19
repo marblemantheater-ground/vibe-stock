@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 # 결과 목록에 함께 보여 줄 전략 값 (실행마다 무엇을 바꿨는지 비교용)
 KEY_FIELDS = ("ma_cross.bar_minutes", "ma_cross.short_window", "ma_cross.long_window", "ma_cross.min_change_rate",
               "ma_cross.max_change_rate", "ma_cross.take_profit_pct", "ma_cross.stop_loss_pct",
-              "ma_cross.capital_usage_pct", "ma_cross.max_positions", "ma_cross.sessions")
+              "ma_cross.capital_usage_pct", "ma_cross.max_positions", "ma_cross.sessions", "ma_cross.off")
 
 
 class RunStore:

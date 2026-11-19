@@ -101,7 +101,7 @@ class PresetStore:
 
     # ── 조회 ───────────────────────────────────────────────
     def _current_values(self) -> dict:
-        return {k: _jsonable(getattr(self.cfg.ma, k)) for k in KEYS}
+        return {k: _jsonable(getattr(self.cfg.params("ma_cross"), k)) for k in KEYS}   # 원래 값 (꺼 둔 기능의 값도)
 
     def _values(self, pid: str) -> dict:
         p = self.presets[pid]
@@ -121,8 +121,10 @@ class PresetStore:
 
     def summary(self, pid: str) -> str:
         v = self._values(pid)
-        return (f"{v['bar_minutes']}분봉 MA{v['short_window']}/MA{v['long_window']} · "
-                f"익절 {v['take_profit_pct']:g}% · 손절 {v['stop_loss_pct']:g}%")
+        off = set(v.get("off") or ())
+        tp = "익절 끔" if "take_profit" in off else f"익절 {v['take_profit_pct']:g}%"
+        sl = "손절 끔" if "stop_loss" in off else f"손절 {v['stop_loss_pct']:g}%"
+        return f"{v['bar_minutes']}분봉 MA{v['short_window']}/MA{v['long_window']} · {tp} · {sl}"
 
     # ── 변경 ───────────────────────────────────────────────
     def _validated(self, values: dict, base: dict) -> dict:

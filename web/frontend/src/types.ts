@@ -52,10 +52,10 @@ export type Position = {
   eval: number;
   pnl: number;
   pnl_pct: number;
-  tp_price: number;
-  sl_price: number;
-  to_tp_pct: number;
-  to_sl_pct: number;
+  tp_price: number | null;   // 익절·손절을 끈 옵션이면 null
+  sl_price: number | null;
+  to_tp_pct: number | null;
+  to_sl_pct: number | null;
   live: boolean;
   preset: string;
   preset_recorded: boolean;
@@ -106,6 +106,7 @@ export type StrategyInfo = {
   budget_per_trade_usd: number;
   max_positions: number;
   sessions: string[];
+  off: string[];   // 꺼 둔 기능 이름
   preset: string | null;
 };
 
@@ -177,7 +178,7 @@ export type SettingField = {
   section: string;
   key: string;
   label: string;
-  type: "number" | "int" | "bool" | "select" | "sessions";
+  type: "number" | "int" | "bool" | "select" | "sessions" | "off" | "toggle";   // off: 꺼 둔 기능 목록(숨김), toggle: 스위치만
   apply: "now" | "next_day" | "file";
   unit: string;
   help: string;
@@ -185,6 +186,8 @@ export type SettingField = {
   max: number | null;
   step: number | null;
   options: { value: string | number; label: string }[];
+  // 켜고 끌 수 있는 칸: 같은 name 의 칸은 함께 켜지고 꺼진다. main 칸에 스위치. zero_key 값이 0 이어도 꺼진 것
+  toggle: { name: string; label: string; main: boolean; zero_key: string | null; on_value: number | null } | null;
   value: SettingValue;
 };
 

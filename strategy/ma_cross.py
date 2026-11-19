@@ -21,6 +21,7 @@ from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from config.toggles import effective as _effective, parse_off, uses as _uses
 from core.ws_client import Tick
 from market.bars import MAX_HISTORY_BARS, Bar, BarBuilder
 from market.clock import ET, KST, MarketClock, Session
@@ -32,6 +33,30 @@ log = logging.getLogger(__name__)
 
 ENTRY_MODES = {"ma_cross": "이평 교차", "breakout": "박스 돌파", "vwap": "VWAP 눌림 반등", "orb": "시가 범위 돌파"}
 _REGULAR_OPEN = dtime(9, 30)
+
+# 켜고 끌 수 있는 기능 (off 목록에 이름이 있으면 꺼짐, 값은 그대로 남음). 순서 = 화면·파일에 쓰는 순서
+TOGGLES = {
+    "change_rate": "등락률 범위", "cooldown": "신호 간격", "rebuy_wait": "매도 후 재매수 대기",
+    "volume": "돌파 거래량 배수", "trailing": "추적 손절", "max_hold": "최대 보유 시간", "flatten": "마감 전 정리",
+    "strength": "체결강도 하한", "spread": "호가 스프레드 상한", "take_profit": "익절", "stop_loss": "손절",
+    "dead_cross": "데드크로스 매도", "capital_usage": "주문가능금액 사용 비율", "daily_target": "하루 목표 수익",
+    "max_buys_per_day": "하루 최대 매수 횟수", "max_positions": "최대 보유 종목 수",
+}
+# 값이 0 이어도 꺼진 것으로 보는 기능 → 그 값 칸 (예전 방식 '0 = 끔' 호환)
+ZERO_OFF = {
+    "cooldown": "cooldown_sec", "rebuy_wait": "rebuy_wait_sec", "volume": "volume_mult",
+    "trailing": "trailing_activate_pct", "max_hold": "max_hold_min", "flatten": "flatten_before_close_min",
+    "strength": "min_strength", "spread": "max_spread_pct", "capital_usage": "capital_usage_pct",
+    "daily_target": "daily_profit_target_pct", "max_buys_per_day": "max_buys_per_day",
+}
+# 꺼졌을 때 매매에 쓰는 값 (없는 것과 같은 값). 익절·손절 0 = 그 기준으로 팔지 않음, 최대 보유 종목 0 = 제한 없음
+_NEUTRAL = {
+    "change_rate": {"min_change_rate": -1000.0, "max_change_rate": 1000.0},
+    "take_profit": {"take_profit_pct": 0.0}, "stop_loss": {"stop_loss_pct": 0.0}, "max_positions": {"max_positions": 0},
+    **{name: {key: 0} for name, key in ZERO_OFF.items()},
+}
+# 손절을 끌 때 대신 켜져 있어야 하는 청산 (하나 이상)
+_STOP_ALTERNATIVES = ("trailing", "max_hold", "flatten")
 
 
 @dataclass(frozen=True)
@@ -62,6 +87,7 @@ class MaCrossParams:
     flatten_before_close_min: float = 0.0  # 마지막 선택 세션이 끝나기 이 시간(분) 전에 전부 매도, 그 뒤로는 매수 안 함 (0 = 끔)
     min_strength: float = 0.0              # (실시간만) 체결강도가 이 값 이상일 때만 매수 (0 = 끔, 100 = 매수·매도 균형)
     max_spread_pct: float = 0.0            # (실시간만) 매수·매도 호가 차이가 이 % 이하일 때만 매수 (0 = 끔)
+    off: tuple[str, ...] = ()              # 꺼 둔 기능 (TOGGLES 이름). 값은 남겨 두고 동작만 끈다
 
     @classmethod
     def from_toml(cls, path: Path) -> MaCrossParams:
@@ -79,6 +105,8 @@ class MaCrossParams:
                 raw["sessions"] = tuple(s if isinstance(s, Session) else Session(str(s).upper()) for s in raw["sessions"])
             except ValueError:
                 raise ValueError("sessions 는 PRE / REGULAR / AFTER 중에서 골라야 합니다") from None
+        if "off" in raw:
+            raw["off"] = parse_off(raw["off"], TOGGLES, "ma_cross")
         params = cls(**raw)
         params.validate()
         return params
@@ -113,24 +141,37 @@ class MaCrossParams:
             raise ValueError("스캘핑 값은 0 이상이어야 합니다")
         if self.trailing_activate_pct and self.trailing_pct <= 0:
             raise ValueError("추적 손절을 켜면 trailing_pct 는 0 보다 커야 합니다")
+        if not self.uses("stop_loss") and not any(self.uses(n) for n in _STOP_ALTERNATIVES):
+            raise ValueError("손절을 끄려면 추적 손절·최대 보유 시간·마감 전 정리 중 하나 이상을 켜야 합니다")
+        if self.uses("capital_usage") and not self.uses("max_positions"):
+            raise ValueError("주문가능금액 사용 비율을 쓰려면 최대 보유 종목 수를 켜야 합니다 (예산을 나누는 수)")
+
+    def uses(self, name: str) -> bool:
+        """기능이 켜져 있는가 (off 목록에 없고, 0 = 끔 항목이면 값이 0 이 아님)."""
+        return _uses(self, name, ZERO_OFF)
+
+    def effective(self) -> MaCrossParams:
+        """매매에 쓰는 값: 꺼진 기능은 없는 것과 같은 값으로 (화면·파일에는 원래 값이 남는다)."""
+        return _effective(self, _NEUTRAL)
 
     @property
     def is_scalp(self) -> bool:
         return self.entry_mode != "ma_cross"
 
     def with_budget_from(self, orderable_usd: float | None) -> MaCrossParams:
-        """capital_usage_pct 가 켜져 있으면 주문가능 USD 로 종목당 1회 예산을 정한다.
+        """주문가능금액 사용 비율이 켜져 있으면 주문가능 USD 로 종목당 1회 예산을 정한다 (매매용 값으로 돌려줌).
         거래일 시작 시 한 번만 계산 → 매수할수록 예산이 줄어드는 일이 없다."""
-        if self.capital_usage_pct <= 0:
-            return self
+        p = self.effective()
+        if p.capital_usage_pct <= 0:
+            return p
         if not orderable_usd or orderable_usd <= 0:
-            log.warning("주문가능 USD 를 알 수 없어 고정 예산 $%s 사용", f"{self.budget_per_trade_usd:,.0f}")
-            return self
-        usable = orderable_usd * self.capital_usage_pct / 100
-        budget = usable / self.max_positions
-        log.info(f"매수 자금: 주문가능 ${orderable_usd:,.2f} × {self.capital_usage_pct:g}% = ${usable:,.2f} "
-                 f"→ 종목당 ${budget:,.2f} (최대 {self.max_positions}종목)")
-        return replace(self, budget_per_trade_usd=budget)
+            log.warning("주문가능 USD 를 알 수 없어 고정 예산 $%s 사용", f"{p.budget_per_trade_usd:,.0f}")
+            return p
+        usable = orderable_usd * p.capital_usage_pct / 100
+        budget = usable / p.max_positions
+        log.info(f"매수 자금: 주문가능 ${orderable_usd:,.2f} × {p.capital_usage_pct:g}% = ${usable:,.2f} "
+                 f"→ 종목당 ${budget:,.2f} (최대 {p.max_positions}종목)")
+        return replace(p, budget_per_trade_usd=budget)
 
 
 def _sma(values: list[float], n: int) -> float:
@@ -172,7 +213,7 @@ class MovingAverageCrossStrategy(Strategy):
     name = "ma_cross"
 
     def __init__(self, params: MaCrossParams, watchlist: list[WatchItem]):
-        self.p = params
+        self.p = params   # 꺼진 기능은 매매용 값으로 바뀌어 들어간다 (아래 p 속성)
         self._items = {w.symbol: w for w in watchlist}
         self._bars = {w.symbol: BarBuilder(params.bar_minutes) for w in watchlist}
         self._exit_bars: dict[str, BarBuilder] = {}   # 산 옵션의 봉 단위가 지금과 다른 보유 종목의 데드크로스용 봉
@@ -185,6 +226,14 @@ class MovingAverageCrossStrategy(Strategy):
         # 거래 옵션: 매수 신호에 붙일 현재 옵션 (id, 이름) / 보유 종목의 산 때 매도 기준 (없으면 현재 값)
         self.preset_info: Callable[[], tuple[str, str]] = lambda: ("", "")
         self.exit_rule: Callable[[str], ExitRule | None] = lambda _symbol: None
+
+    @property
+    def p(self) -> MaCrossParams:
+        return self._p
+
+    @p.setter
+    def p(self, params: MaCrossParams) -> None:
+        self._p = params.effective()
 
     def add_item(self, item: WatchItem) -> None:
         """거래일 중간에 감시 종목 추가 (예: HTS 에서 새로 산 종목의 익절·손절 감시)."""
@@ -300,9 +349,9 @@ class MovingAverageCrossStrategy(Strategy):
         r = rule or ExitRule.from_params(self.p)
         price = tick.price
         pnl_pct = (price / pos.avg_price - 1) * 100
-        if pnl_pct <= -r.stop_loss_pct:
+        if r.stop_loss_pct and pnl_pct <= -r.stop_loss_pct:     # 0 = 손절 끔
             return self._sell(tick, pos, rule, f"손절 {pnl_pct:+.2f}%")
-        if pnl_pct >= r.take_profit_pct:
+        if r.take_profit_pct and pnl_pct >= r.take_profit_pct:  # 0 = 익절 끔
             return self._sell(tick, pos, rule, f"익절 {pnl_pct:+.2f}%")
         peak = self._peak[tick.symbol] = max(self._peak.get(tick.symbol, pos.avg_price), price)
         if r.trailing_activate_pct and (peak / pos.avg_price - 1) * 100 >= r.trailing_activate_pct \
@@ -317,6 +366,8 @@ class MovingAverageCrossStrategy(Strategy):
         return None
 
     def _check_dead(self, tick: Tick, closes: list[float], pos, rule: ExitRule | None) -> Signal | None:
+        if not (rule.dead_cross if rule else self.p.uses("dead_cross")):
+            return None
         s = rule.short_window if rule else self.p.short_window
         l = rule.long_window if rule else self.p.long_window
         if len(closes) <= l or pos.orderable_qty <= 0:
@@ -356,7 +407,7 @@ class MovingAverageCrossStrategy(Strategy):
             log.info("[%s] %s 신호지만 호가 스프레드 %.3f%% > %g%% → 매수 보류", sym, ENTRY_MODES[p.entry_mode], spread,
                      p.max_spread_pct)
             return None
-        if ctx.position_count() >= p.max_positions:
+        if p.max_positions and ctx.position_count() >= p.max_positions:   # 0 = 제한 끔
             log.info("[%s] %s 신호지만 최대 보유 종목 수(%d) 도달", sym, ENTRY_MODES[p.entry_mode], p.max_positions)
             return None
         if p.max_buys_per_day and (n := ctx.buys_today()) >= p.max_buys_per_day:

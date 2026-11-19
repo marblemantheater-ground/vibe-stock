@@ -37,12 +37,14 @@ class ExitRule:
     trailing_pct: float = 0.0
     max_hold_min: float = 0.0
     flatten_before_close_min: float = 0.0
+    dead_cross: bool = True               # 데드크로스 매도 켬/끔 (익절·손절 0 = 그 기준 끔)
 
     @classmethod
     def from_params(cls, p, preset_id: str = "", preset_name: str = "") -> ExitRule:
+        p = p.effective()   # 꺼진 기능은 0 으로 기록
         return cls(preset_id, preset_name, p.take_profit_pct, p.stop_loss_pct, p.bar_minutes, p.short_window,
                    p.long_window, p.entry_mode, p.trailing_activate_pct, p.trailing_pct, p.max_hold_min,
-                   p.flatten_before_close_min)
+                   p.flatten_before_close_min, p.uses("dead_cross"))
 
     @classmethod
     def from_dict(cls, d: dict) -> ExitRule:
@@ -50,14 +52,18 @@ class ExitRule:
                    float(d["stop_loss_pct"]), int(d["bar_minutes"]), int(d["short_window"]), int(d["long_window"]),
                    str(d.get("entry_mode", "ma_cross")), float(d.get("trailing_activate_pct", 0)),
                    float(d.get("trailing_pct", 0)), float(d.get("max_hold_min", 0)),
-                   float(d.get("flatten_before_close_min", 0)))
+                   float(d.get("flatten_before_close_min", 0)), bool(d.get("dead_cross", True)))
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     def summary(self) -> str:
         parts = [f"{self.bar_minutes}분봉 MA{self.short_window}/MA{self.long_window}" if self.entry_mode == "ma_cross"
-                 else f"{self.bar_minutes}분봉 스캘핑", f"익절 {self.take_profit_pct:g}%", f"손절 {self.stop_loss_pct:g}%"]
+                 else f"{self.bar_minutes}분봉 스캘핑",
+                 f"익절 {self.take_profit_pct:g}%" if self.take_profit_pct else "익절 끔",
+                 f"손절 {self.stop_loss_pct:g}%" if self.stop_loss_pct else "손절 끔"]
+        if self.entry_mode == "ma_cross" and not self.dead_cross:
+            parts.append("데드크로스 끔")
         if self.trailing_activate_pct:
             parts.append(f"추적 +{self.trailing_activate_pct:g}%/−{self.trailing_pct:g}%")
         if self.max_hold_min:

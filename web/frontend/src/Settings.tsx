@@ -9,8 +9,57 @@ type Draft = Record<string, SettingValue>;
 const APPLY_LABEL = { now: "바로 적용", next_day: "다음 거래일부터", file: "파일에서만" } as const;
 
 export function same(a: SettingValue, b: SettingValue): boolean {
-  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => x === b[i]);
+  // 목록(세션·꺼 둔 기능)은 순서와 상관없이 같은 항목이면 같다
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x) => (b as string[]).includes(x));
   return a === b;
+}
+
+// ── 켜고 끄기 ── get(key) 는 같은 섹션의 칸 값 (key = "off", "trailing_activate_pct" …)
+export type Get = (key: string) => SettingValue | undefined;
+
+export function isOn(f: SettingField, get: Get): boolean {
+  const t = f.toggle;
+  if (!t) return true;
+  if (((get("off") as string[] | undefined) ?? []).includes(t.name)) return false;
+  if (t.zero_key) {   // 예전 방식 '0 = 끔' 도 꺼진 것으로
+    const v = String(get(t.zero_key) ?? "").trim().replace(/,/g, "");
+    return v === "" || Number(v) !== 0;
+  }
+  return true;
+}
+
+// 스위치를 누르면 바뀌는 값들: off 목록 (+ 다시 켤 때 값이 0 이면 기본값)
+export function toggleChanges(f: SettingField, on: boolean, get: Get): Record<string, SettingValue> {
+  const t = f.toggle!;
+  const off = ((get("off") as string[] | undefined) ?? []).filter((n) => n !== t.name);
+  const out: Record<string, SettingValue> = { off: on ? off : [...off, t.name] };
+  if (on && t.zero_key && t.on_value !== null && Number(String(get(t.zero_key) ?? "0").replace(/,/g, "")) === 0)
+    out[t.zero_key] = t.on_value;
+  return out;
+}
+
+// 꺼 둔 기능 목록이 바뀐 것을 "추적 손절 켬 → 끔" 줄로 풀어 쓴다
+export function offDiff(f: SettingField, before: SettingValue, after: SettingValue): { name: string; label: string; on: boolean }[] {
+  const a = (before as string[]) ?? [], b = (after as string[]) ?? [];
+  return f.options.filter((o) => a.includes(String(o.value)) !== b.includes(String(o.value)))
+    .map((o) => ({ name: String(o.value), label: o.label, on: !b.includes(String(o.value)) }));
+}
+
+// 켜고 끄기를 포함한 한 칸. 값은 get 으로 읽고, 바뀐 값은 onSet({key: value}) 으로 알린다
+export function SettingRow({ f, get, orig, error, changed, onSet, idPrefix = "set" }: {
+  f: SettingField; get: Get; orig: Get; error?: string; changed: boolean;
+  onSet: (values: Record<string, SettingValue>) => void; idPrefix?: string;
+}) {
+  if (f.type === "off") return null;   // 목록 자체는 각 칸의 스위치로 보인다
+  const t = f.toggle;
+  const on = isOn(f, get);
+  const toggled = Boolean(t?.main) && on !== isOn(f, orig);
+  return (
+    <FieldRow f={{ ...f, id: `${idPrefix}-${f.id}` }} value={f.type === "toggle" ? on : (get(f.key) ?? f.value)}
+              error={error} changed={changed || toggled} dim={!on}
+              toggle={t?.main ? { on, label: t.label, onToggle: (v) => onSet(toggleChanges(f, v, get)) } : undefined}
+              onChange={(v) => onSet({ [f.key]: v })} />
+  );
 }
 
 export function parse(f: SettingField, raw: SettingValue): { value?: SettingValue; error?: string } {
@@ -25,7 +74,8 @@ export function parse(f: SettingField, raw: SettingValue): { value?: SettingValu
 }
 
 export function show(f: SettingField, v: SettingValue): string {
-  if (f.type === "bool") return v ? "켬" : "끔";
+  if (f.type === "bool" || f.type === "toggle") return v ? "켬" : "끔";
+  if (f.type === "off") return ((v as string[]) ?? []).map((n) => f.options.find((o) => o.value === n)?.label ?? n).join(", ") || "없음";
   if (f.type === "sessions") return (v as string[]).map((s) => f.options.find((o) => o.value === s)?.label ?? s).join(" / ") || "없음";
   if (f.options.length) return f.options.find((o) => o.value === v)?.label ?? String(v);
   const n = Number(v).toLocaleString("en-US", { maximumFractionDigits: 4 });
@@ -41,6 +91,9 @@ export default function Settings() {
   const [toast, setToast] = useState<Toast | null>(null);
 
   const fields = useMemo(() => view?.groups.flatMap((g) => g.fields) ?? [], [view]);
+  const byId = useMemo(() => Object.fromEntries(fields.map((f) => [f.id, f])), [fields]);
+  const getter = (section: string): Get => (key) => draft[`${section}.${key}`] ?? byId[`${section}.${key}`]?.value;
+  const origGetter = (section: string): Get => (key) => byId[`${section}.${key}`]?.value;
 
   const adopt = useCallback((v: SettingsView) => {
     setView(v);
@@ -71,7 +124,7 @@ export default function Settings() {
     const changed: { f: SettingField; value: SettingValue }[] = [];
     const errors: Record<string, string> = {};
     for (const f of fields) {
-      if (!(f.id in draft)) continue;
+      if (!(f.id in draft) || f.type === "toggle") continue;
       const p = parse(f, draft[f.id]);
       if (p.error) errors[f.id] = p.error;
       else if (!same(p.value!, f.value)) changed.push({ f, value: p.value! });
@@ -141,9 +194,9 @@ export default function Settings() {
             </div>
             <div className="fields">
               {g.fields.map((f) => (
-                <FieldRow key={f.id} f={f} value={draft[f.id] ?? f.value} error={errors[f.id]}
-                          changed={changed.some((c) => c.f.id === f.id)}
-                          onChange={(v) => setDraft((d) => ({ ...d, [f.id]: v }))} />
+                <SettingRow key={f.id} f={f} get={getter(f.section)} orig={origGetter(f.section)} error={errors[f.id]}
+                            changed={changed.some((c) => c.f.id === f.id)}
+                            onSet={(vals) => setDraft((d) => ({ ...d, ...prefixed(f.section, vals) }))} />
               ))}
             </div>
           </section>
@@ -170,7 +223,13 @@ export default function Settings() {
       {confirming && (
         <Dialog title="설정 저장" onCancel={() => setConfirming(false)}>
           <ul className="change-list">
-            {changed.map(({ f, value }) => (
+            {changed.map(({ f, value }) => f.type === "off" ? offDiff(f, f.value, value).map((d) => (
+              <li key={`${f.id}.${d.name}`}>
+                <span>{d.label}</span>
+                <span className="num"><span className="muted">{d.on ? "끔" : "켬"}</span> → <strong>{d.on ? "켬" : "끔"}</strong></span>
+                <span className={`pill tone-${view.trading ? "good" : "idle"}`}>{view.trading ? "바로 적용" : "다음 세션부터"}</span>
+              </li>
+            )) : (
               <li key={f.id}>
                 <span>{f.label}</span>
                 <span className="num">
@@ -203,10 +262,20 @@ export default function Settings() {
   );
 }
 
+// {key: value} → {"section.key": value}
+export function prefixed(section: string, vals: Record<string, SettingValue>): Record<string, SettingValue> {
+  return Object.fromEntries(Object.entries(vals).map(([k, v]) => [`${section}.${k}`, v]));
+}
+
 // 저장 전에 알아 두면 좋은 영향
 function riskNotes(changed: { f: SettingField; value: SettingValue }[]): string[] {
   const notes: string[] = [];
   const has = (k: string) => changed.find((c) => c.f.key === k);
+  const offChanged = changed.filter((c) => c.f.type === "off").flatMap((c) => offDiff(c.f, c.f.value, c.value));
+  if (offChanged.some((d) => d.name === "stop_loss" && !d.on))
+    notes.push("손절을 끄면 정해진 손실에서 팔지 않습니다. 추적 손절·최대 보유 시간·마감 전 정리로만 빠져나옵니다.");
+  if (offChanged.some((d) => (d.name === "daily_loss" || d.name === "max_drawdown") && !d.on))
+    notes.push("손실 한도를 끄면 손실이 커져도 매매가 멈추지 않습니다.");
   if (has("daily_loss_limit_pct") || has("max_drawdown_pct"))
     notes.push("손실 한도를 낮추면 지금 손실이 이미 새 한도를 넘었을 경우 확인 시간 뒤 바로 매매가 멈춥니다. 이미 멈춘 상태는 한도를 올려도 풀리지 않습니다 (재개 버튼).");
   if (has("capital_usage_pct") || has("budget_per_trade_usd") || has("max_positions"))
@@ -216,18 +285,39 @@ function riskNotes(changed: { f: SettingField; value: SettingValue }[]): string[
   return notes;
 }
 
-export function FieldRow({ f, value, error, changed, onChange }: {
+export function FieldRow({ f, value, error, changed, onChange, dim = false, toggle }: {
   f: SettingField; value: SettingValue; error?: string; changed: boolean; onChange: (v: SettingValue) => void;
+  dim?: boolean;   // 꺼진 기능의 칸: 값은 남아 있고 흐리게
+  toggle?: { on: boolean; label: string; onToggle: (on: boolean) => void };
 }) {
   const locked = f.apply === "file";
-  const id = `set-${f.id}`;
+  const id = /^(set|preset|bt)-/.test(f.id) ? f.id : `set-${f.id}`;
+  const sw = toggle && (
+    <label className="switch mini" title={`${toggle.label} ${toggle.on ? "끄기" : "켜기"}`}>
+      <input type="checkbox" checked={toggle.on} aria-label={`${toggle.label} 켬/끔`}
+             onChange={(e) => toggle.onToggle(e.target.checked)} />
+      <span>{toggle.on ? "켬" : "끔"}</span>
+    </label>
+  );
+  if (f.type === "toggle")   // 값 없이 켬/끔만 있는 기능
+    return (
+      <div className={`field ${changed ? "changed" : ""} ${dim ? "off" : ""}`}>
+        <div className="field-text"><span className="field-label">{f.label}</span>
+          {f.help && <span className="field-help">{f.help}</span>}
+          {changed && <span className="field-help">원래 {dim ? "켬" : "끔"}</span>}</div>
+        <div className="field-input">{sw}</div>
+      </div>
+    );
   return (
-    <div className={`field ${changed ? "changed" : ""} ${error ? "invalid" : ""}`}>
+    <div className={`field ${changed ? "changed" : ""} ${error ? "invalid" : ""} ${dim ? "off" : ""}`}>
       <div className="field-text">
-        <label htmlFor={id}>
+        <span className="field-head">
+          {sw}
+          <label htmlFor={id}>
           {f.label}
           {f.apply !== "now" && <span className={`apply-tag ${f.apply}`}>{APPLY_LABEL[f.apply]}</span>}
-        </label>
+          </label>
+        </span>
         {f.help && <span className="field-help">{f.help}</span>}
         {changed && <span className="field-help">원래 값 {show(f, f.value)}</span>}
       </div>

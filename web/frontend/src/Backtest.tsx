@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { BtResult, BtRunSummary, BtStatus, Coverage, SettingField, SettingValue, SettingsView } from "./types";
-import { FieldRow, parse, same, show } from "./Settings";
+import { SettingRow, offDiff, parse, prefixed, same, show } from "./Settings";
 import { Dialog } from "./Controls";
 import { pct, tone, usd } from "./format";
 import { useWidth } from "./Reports";
@@ -60,6 +60,7 @@ export default function Backtest() {
     const overrides: Record<string, SettingValue> = {};
     const errors: Record<string, string> = {};
     for (const f of fields) {
+      if (f.type === "toggle") continue;   // 켬/끔은 off 목록 칸으로 전달
       const p = parse(f, draft[f.id] ?? f.value);
       if (p.error) errors[f.id] = p.error;
       else if (!same(p.value!, f.value)) overrides[f.id] = p.value!;
@@ -169,8 +170,10 @@ export default function Backtest() {
         </div>
         <div className="fields bt-scroll">
           {fields.map((f) => (
-            <FieldRow key={f.id} f={{ ...f, apply: "now" }} value={draft[f.id] ?? f.value} error={errors[f.id]}
-                      changed={f.id in overrides} onChange={(v) => setDraft((d) => ({ ...d, [f.id]: v }))} />
+            <SettingRow key={f.id} f={{ ...f, apply: "now" }} idPrefix="bt" error={errors[f.id]} changed={f.id in overrides}
+                        get={(k) => draft[`${f.section}.${k}`] ?? byId[`${f.section}.${k}`]?.value}
+                        orig={(k) => byId[`${f.section}.${k}`]?.value}
+                        onSet={(vals) => setDraft((d) => ({ ...d, ...prefixed(f.section, vals) }))} />
           ))}
         </div>
         <div className="bt-run">
@@ -225,11 +228,15 @@ export default function Backtest() {
       {applying && result && (
         <Dialog title="이 값을 설정에 적용" onCancel={() => setApplying(false)}>
           <ul className="change-list">
-            {Object.entries(result.overrides).map(([id, v]) => byId[id] && (
+            {Object.entries(result.overrides).map(([id, v]) => byId[id] && (byId[id].type === "off" ? offDiff(byId[id], byId[id].value, v).map((d) => (
+              <li key={`${id}.${d.name}`}><span>{d.label}</span>
+                <span className="num"><span className="muted">{d.on ? "끔" : "켬"}</span> → <strong>{d.on ? "켬" : "끔"}</strong></span>
+                <span className="pill tone-good">바로 적용</span></li>
+            )) : (
               <li key={id}><span>{byId[id].label}</span>
                 <span className="num"><span className="muted">{show(byId[id], byId[id].value)}</span> → <strong>{show(byId[id], v)}</strong></span>
                 <span className={`pill tone-${byId[id].apply === "now" ? "good" : "idle"}`}>{byId[id].apply === "now" ? "바로 적용" : "다음 거래일부터"}</span></li>
-            ))}
+            )))}
           </ul>
           {result.trades < FEW_TRADES && <p className="warn-box">거래가 {result.trades}건뿐입니다. 이 결과만으로 설정을 바꾸면 우연에 맞춘 값일 수 있습니다.</p>}
           {view.env === "real" && <p className="warn-box">실전 계좌입니다. 바꾼 값으로 실제 주문이 나갑니다.</p>}
@@ -245,7 +252,12 @@ export default function Backtest() {
 }
 
 function overrideText(o: Record<string, SettingValue>, byId: Record<string, SettingField>): string {
-  const parts = Object.entries(o ?? {}).map(([id, v]) => (byId[id] ? `${byId[id].label} ${show(byId[id], v)}` : id));
+  const parts = Object.entries(o ?? {}).map(([id, v]) => {
+    const f = byId[id];
+    if (!f) return id;
+    if (f.type === "off") return offDiff(f, f.value, v).map((d) => `${d.label} ${d.on ? "켬" : "끔"}`).join(", ");
+    return `${f.label} ${show(f, v)}`;
+  }).filter(Boolean);
   return parts.length ? parts.join(", ") : "현재 설정";
 }
 

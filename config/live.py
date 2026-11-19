@@ -22,8 +22,9 @@ from broker.order import OrderParams
 from core.notifier import NOTIFY
 from market.clock import Session
 from report.annual import FeeParams, TaxParams
-from risk.guard import RiskParams
-from strategy.ma_cross import MaCrossParams
+from broker.order import ORDER_TOGGLES
+from risk.guard import RISK_TOGGLES, RiskParams
+from strategy.ma_cross import TOGGLES as MA_TOGGLES, ZERO_OFF as MA_ZERO_OFF, MaCrossParams
 
 log = logging.getLogger(__name__)
 
@@ -45,11 +46,25 @@ class Field:
     max: float | None = None
     step: float | None = None
     options: tuple[tuple[Any, str], ...] = ()
+    toggle: str = ""          # 켜고 끄는 기능 이름 (같은 이름의 칸은 함께 켜지고 꺼짐, 첫 칸에 스위치)
 
     @property
     def id(self) -> str:
         return f"{self.section}.{self.key}"
 
+    @property
+    def stored(self) -> bool:
+        """설정 값으로 저장되는 칸인가 (스위치만 있는 칸은 off 목록으로 저장)."""
+        return self.type != "toggle"
+
+
+# 섹션별 켜고 끌 수 있는 기능, 0 = 끔 인 값 칸, 다시 켤 때 값이 0 이면 넣어 줄 값
+TOGGLES = {"ma_cross": MA_TOGGLES, "order": ORDER_TOGGLES, "risk": RISK_TOGGLES}
+ZERO_OFF = {"ma_cross": MA_ZERO_OFF, "order": {"buys_per_symbol": "max_buys_per_symbol"},
+            "risk": {"daily_loss": "daily_loss_limit_pct", "max_drawdown": "max_drawdown_pct"}}
+ON_VALUES = {"cooldown": 300, "rebuy_wait": 60, "volume": 1.5, "trailing": 1.0, "max_hold": 15, "flatten": 10,
+             "strength": 100, "spread": 0.1, "capital_usage": 50, "daily_target": 3, "max_buys_per_day": 20,
+             "buys_per_symbol": 2, "daily_loss": 5, "max_drawdown": 15}
 
 _ACTION_OPTS = (("block_buys", "신규 매수만 중지"), ("liquidate", "전부 청산"))
 _SESSION_OPTS = tuple((s.value, s.label) for s in (Session.PRE, Session.REGULAR, Session.AFTER))
@@ -57,15 +72,19 @@ _SESSION_OPTS = tuple((s.value, s.label) for s in (Session.PRE, Session.REGULAR,
 GROUPS = ("매수 신호", "스캘핑", "익절·손절", "자금 배분", "하루 목표·한도", "주문", "손실 차단", "수수료·세금", "안전 스위치")
 
 FIELDS: tuple[Field, ...] = (
+    # ── 꺼 둔 기능 목록 (화면에는 각 칸의 스위치로 보인다) ──
+    Field("ma_cross", "off", "꺼 둔 기능", "off", "매수 신호", options=tuple(MA_TOGGLES.items())),
+    Field("order", "off", "꺼 둔 주문 규칙", "off", "주문", options=tuple(ORDER_TOGGLES.items())),
+    Field("risk", "off", "꺼 둔 손실 한도", "off", "손실 차단", options=tuple(RISK_TOGGLES.items())),
     # ── 매수 신호 ──
     Field("ma_cross", "sessions", "매매할 세션", "sessions", "매수 신호", options=_SESSION_OPTS,
           help="신호를 낼 시간대. 고르지 않은 세션에는 익절·손절 매도도 하지 않습니다"),
-    Field("ma_cross", "min_change_rate", "등락률 하한", "number", "매수 신호", unit="%", min=-30, max=30, step=0.1,
+    Field("ma_cross", "min_change_rate", "등락률 하한", "number", "매수 신호", toggle="change_rate", unit="%", min=-30, max=30, step=0.1,
           help="골든크로스가 나도 전일 대비 등락률이 이 범위 밖이면 매수하지 않습니다"),
-    Field("ma_cross", "max_change_rate", "등락률 상한", "number", "매수 신호", unit="%", min=-30, max=30, step=0.1),
-    Field("ma_cross", "cooldown_sec", "신호 간격", "int", "매수 신호", unit="초", min=0, max=3600, step=10,
+    Field("ma_cross", "max_change_rate", "등락률 상한", "number", "매수 신호", toggle="change_rate", unit="%", min=-30, max=30, step=0.1),
+    Field("ma_cross", "cooldown_sec", "신호 간격", "int", "매수 신호", toggle="cooldown", unit="초", min=0, max=3600, step=10,
           help="한 종목에서 신호가 난 뒤 이 시간 동안 같은 종목 신호를 무시합니다"),
-    Field("ma_cross", "rebuy_wait_sec", "매도 후 재매수 대기", "int", "매수 신호", unit="초", min=0, max=86_400, step=10,
+    Field("ma_cross", "rebuy_wait_sec", "매도 후 재매수 대기", "int", "매수 신호", toggle="rebuy_wait", unit="초", min=0, max=86_400, step=10,
           help="같은 종목을 판(체결) 뒤 이 시간 동안은 다시 사지 않음 (0 = 바로 가능). 매도는 막지 않음. "
                "같은 날 다시 사려면 주문 > '종목당 하루 매수 횟수'도 2 이상이어야 함"),
     Field("ma_cross", "bar_minutes", "봉 단위", "select", "매수 신호", apply="next_day",
@@ -83,39 +102,41 @@ FIELDS: tuple[Field, ...] = (
           help="박스 돌파에서 직전 몇 개 봉의 최고가를 넘으면 살지"),
     Field("ma_cross", "orb_minutes", "시가 범위 시간", "int", "스캘핑", unit="분", min=1, max=120, step=1,
           help="시가 범위 돌파에서 정규장 시작 후 몇 분을 범위로 볼지"),
-    Field("ma_cross", "volume_mult", "돌파 거래량 배수", "number", "스캘핑", unit="배", min=0, max=50, step=0.1,
+    Field("ma_cross", "volume_mult", "돌파 거래량 배수", "number", "스캘핑", toggle="volume", unit="배", min=0, max=50, step=0.1,
           help="돌파 봉 거래량이 기준 봉 평균의 이 배 이상일 때만 매수 (0 = 끔). 거래량 없는 돌파는 실패가 많음"),
-    Field("ma_cross", "trailing_activate_pct", "추적 손절 시작", "number", "스캘핑", unit="%", min=0, max=50, step=0.1,
+    Field("ma_cross", "trailing_activate_pct", "추적 손절 시작", "number", "스캘핑", toggle="trailing", unit="%", min=0, max=50, step=0.1,
           help="고점이 매입가 대비 이만큼 오르면 추적 손절을 켬 (0 = 끔)"),
-    Field("ma_cross", "trailing_pct", "추적 손절 폭", "number", "스캘핑", unit="%", min=0.05, max=20, step=0.05,
+    Field("ma_cross", "trailing_pct", "추적 손절 폭", "number", "스캘핑", toggle="trailing", unit="%", min=0.05, max=20, step=0.05,
           help="추적 손절이 켜진 뒤 고점 대비 이만큼 밀리면 매도"),
-    Field("ma_cross", "max_hold_min", "최대 보유 시간", "int", "스캘핑", unit="분", min=0, max=1440, step=1,
+    Field("ma_cross", "max_hold_min", "최대 보유 시간", "int", "스캘핑", toggle="max_hold", unit="분", min=0, max=1440, step=1,
           help="산 뒤 이 시간이 지나면 손익과 상관없이 매도 (0 = 끔). 움직이지 않는 종목에 돈이 묶이지 않게"),
-    Field("ma_cross", "flatten_before_close_min", "마감 전 정리", "int", "스캘핑", unit="분", min=0, max=240, step=1,
+    Field("ma_cross", "flatten_before_close_min", "마감 전 정리", "int", "스캘핑", toggle="flatten", unit="분", min=0, max=240, step=1,
           help="고른 세션 중 마지막 세션이 끝나기 이 시간 전에 보유 전부 매도, 그 뒤로는 매수 안 함 (0 = 끔)"),
-    Field("ma_cross", "min_strength", "체결강도 하한 (실시간)", "number", "스캘핑", min=0, max=1000, step=5,
+    Field("ma_cross", "min_strength", "체결강도 하한 (실시간)", "number", "스캘핑", toggle="strength", min=0, max=1000, step=5,
           help="체결강도가 이 값 이상일 때만 매수 (0 = 끔, 100 = 매수·매도 균형). 분봉에 없어 백테스트에는 적용 안 됨"),
-    Field("ma_cross", "max_spread_pct", "호가 스프레드 상한 (실시간)", "number", "스캘핑", unit="%", min=0, max=5, step=0.01,
+    Field("ma_cross", "max_spread_pct", "호가 스프레드 상한 (실시간)", "number", "스캘핑", toggle="spread", unit="%", min=0, max=5, step=0.01,
           help="최우선 매수·매도 호가 차이가 이 % 이하일 때만 매수 (0 = 끔). 백테스트에는 적용 안 됨"),
     # ── 익절·손절 ──
-    Field("ma_cross", "take_profit_pct", "익절", "number", "익절·손절", unit="%", min=0.1, max=100, step=0.1,
+    Field("ma_cross", "take_profit_pct", "익절", "number", "익절·손절", toggle="take_profit", unit="%", min=0.1, max=100, step=0.1,
           help="매입평균가 대비 이만큼 오르면 전량 매도"),
-    Field("ma_cross", "stop_loss_pct", "손절", "number", "익절·손절", unit="%", min=0.1, max=50, step=0.1,
-          help="매입평균가 대비 이만큼 내리면 전량 매도"),
+    Field("ma_cross", "stop_loss_pct", "손절", "number", "익절·손절", toggle="stop_loss", unit="%", min=0.1, max=50, step=0.1,
+          help="매입평균가 대비 이만큼 내리면 전량 매도. 끄려면 추적 손절·최대 보유 시간·마감 전 정리 중 하나 이상이 켜져 있어야 함"),
+    Field("ma_cross", "dead_cross", "데드크로스 매도", "toggle", "익절·손절", toggle="dead_cross",
+          help="이평 교차로 산 종목을 단기 이평이 장기 이평 아래로 내려갈 때 매도"),
     # ── 자금 배분 ──
-    Field("ma_cross", "capital_usage_pct", "주문가능금액 사용 비율", "number", "자금 배분", unit="%", min=0, max=100, step=1,
-          help="종목당 예산 = 거래일 시작 시 주문가능 USD × 비율 ÷ 최대 보유 종목 수. 0 이면 아래 고정 금액 사용"),
+    Field("ma_cross", "capital_usage_pct", "주문가능금액 사용 비율", "number", "자금 배분", toggle="capital_usage", unit="%", min=0, max=100, step=1,
+          help="종목당 예산 = 거래일 시작 시 주문가능 USD × 비율 ÷ 최대 보유 종목 수. 끄면 아래 고정 금액 사용"),
     Field("ma_cross", "budget_per_trade_usd", "1회 매수 고정 금액", "number", "자금 배분", unit="USD", min=1, max=10_000_000, step=100,
-          help="사용 비율이 0 일 때만 씁니다"),
+          help="주문가능금액 사용 비율을 끄면 씁니다"),
     # ── 하루 목표·한도 (거래 옵션마다 다르게) ──
-    Field("ma_cross", "daily_profit_target_pct", "하루 목표 수익", "number", "하루 목표·한도", unit="%", min=0, max=100, step=0.5,
+    Field("ma_cross", "daily_profit_target_pct", "하루 목표 수익", "number", "하루 목표·한도", toggle="daily_target", unit="%", min=0, max=100, step=0.5,
           help="오늘 손익(실현+보유 평가)이 하루 시작 예수금의 이 비율 이상이면 보유 전부 매도하고 그날 매매 종료. "
                "다음 거래일 자동 재개 (0 = 끔)"),
-    Field("ma_cross", "max_buys_per_day", "하루 최대 매수 횟수", "int", "하루 목표·한도", unit="회", min=0, max=1000, step=1,
+    Field("ma_cross", "max_buys_per_day", "하루 최대 매수 횟수", "int", "하루 목표·한도", toggle="max_buys_per_day", unit="회", min=0, max=1000, step=1,
           help="오늘 매수가 이 횟수에 닿으면 더 사지 않음 (0 = 제한 없음). 매도는 막지 않음. 1회 금액은 자금 배분 설정"),
-    Field("ma_cross", "max_positions", "최대 보유 종목 수", "int", "하루 목표·한도", unit="종목", min=1, max=50, step=1,
+    Field("ma_cross", "max_positions", "최대 보유 종목 수", "int", "하루 목표·한도", toggle="max_positions", unit="종목", min=1, max=50, step=1,
           help="보유(+매수 대기) 종목이 이 수에 닿으면 새 종목을 사지 않음. 하나가 팔리면 다시 매수. "
-               "사용 비율로 예산을 정할 때 나누는 수이기도 함"),
+               "사용 비율로 예산을 정할 때 나누는 수이기도 함 (끄면 종목 수 제한 없음, 이때는 고정 금액만 씀)"),
     # ── 주문 ──
     Field("order", "slippage_pct", "지정가 여유", "number", "주문", unit="%", min=0, max=4.9, step=0.05,
           help="매수는 현재가보다 이만큼 높게, 매도는 낮게 지정가를 냅니다 (사실상 즉시 체결)"),
@@ -124,17 +145,17 @@ FIELDS: tuple[Field, ...] = (
     Field("order", "poll_interval_sec", "체결 확인 주기", "int", "주문", unit="초", min=1, max=60, step=1),
     Field("order", "max_orders_per_day", "하루 최대 주문", "int", "주문", unit="건", min=1, max=1000, step=1,
           help="모든 옵션 공통 안전 한도 (매수·매도 합계, 거부 제외). 한도에 닿으면 매수만 막고 매도는 계속"),
-    Field("order", "max_buys_per_symbol", "종목당 하루 매수 횟수", "int", "주문", unit="회", min=0, max=100, step=1,
+    Field("order", "max_buys_per_symbol", "종목당 하루 매수 횟수", "int", "주문", toggle="buys_per_symbol", unit="회", min=0, max=100, step=1,
           help="0 = 제한 없음. 1 이면 손절한 종목을 같은 날 다시 사지 않습니다"),
     Field("order", "cancel_buy_above_limit", "가격 이탈 시 매수 취소", "bool", "주문",
           help="현재가가 매수 지정가 위로 오르면 미체결 매수를 바로 취소합니다"),
     # ── 손실 차단 ──
-    Field("risk", "daily_loss_limit_pct", "하루 손실 한도", "number", "손실 차단", unit="%", min=0, max=99, step=0.5,
+    Field("risk", "daily_loss_limit_pct", "하루 손실 한도", "number", "손실 차단", toggle="daily_loss", unit="%", min=0, max=99, step=0.5,
           help="오늘 시작 총자산 대비 이만큼 잃으면 그날 매매 중지 (0 = 끔)"),
-    Field("risk", "daily_loss_action", "하루 손실 한도 도달 시", "select", "손실 차단", options=_ACTION_OPTS),
-    Field("risk", "max_drawdown_pct", "최대 낙폭 한도", "number", "손실 차단", unit="%", min=0, max=99, step=0.5,
+    Field("risk", "daily_loss_action", "하루 손실 한도 도달 시", "select", "손실 차단", toggle="daily_loss", options=_ACTION_OPTS),
+    Field("risk", "max_drawdown_pct", "최대 낙폭 한도", "number", "손실 차단", toggle="max_drawdown", unit="%", min=0, max=99, step=0.5,
           help="고점 대비 이만큼 빠지면 재개할 때까지 매매 중지 (0 = 끔)"),
-    Field("risk", "max_drawdown_action", "최대 낙폭 도달 시", "select", "손실 차단", options=_ACTION_OPTS),
+    Field("risk", "max_drawdown_action", "최대 낙폭 도달 시", "select", "손실 차단", toggle="max_drawdown", options=_ACTION_OPTS),
     Field("risk", "confirm_sec", "발동 확인 시간", "int", "손실 차단", unit="초", min=0, max=600, step=1,
           help="한도 초과가 이 시간 동안 이어져야 발동 (순간적인 이상 시세 무시)"),
     Field("risk", "liquidation_slippage_pct", "청산 지정가 여유", "number", "손실 차단", unit="%", min=0, max=9.9, step=0.1,
@@ -159,6 +180,17 @@ FIELDS: tuple[Field, ...] = (
     Field("order", "cancel_open_orders_on_start", "시작 시 기존 미체결 취소", "bool", "안전 스위치", apply="file"),
 )
 _BY_ID = {f.id: f for f in FIELDS}
+_STORED = tuple(f for f in FIELDS if f.stored)
+
+
+def toggle_meta(f: Field) -> dict | None:
+    """화면용 스위치 정보: 이름, 이 칸에 스위치를 그릴지(main), 0 = 끔 인 값 칸, 다시 켤 때 넣을 값."""
+    if not f.toggle:
+        return None
+    main = next(x for x in FIELDS if x.section == f.section and x.toggle == f.toggle)
+    zero_key = ZERO_OFF.get(f.section, {}).get(f.toggle)
+    return {"name": f.toggle, "label": TOGGLES[f.section][f.toggle], "main": main is f,
+            "zero_key": zero_key, "on_value": ON_VALUES.get(f.toggle)}
 
 
 @dataclass(frozen=True)
@@ -168,7 +200,13 @@ class Change:
     new: Any
 
     def text(self) -> str:
-        return f"{self.field.label} {_show(self.field, self.old)} → {_show(self.field, self.new)}"
+        f = self.field
+        if f.type == "off":   # "추적 손절 끔, 손절 켬"
+            old, new = set(_jsonable(self.old)), set(_jsonable(self.new))
+            names = dict(f.options)
+            return ", ".join([f"{names.get(n, n)} 끔" for n in names if n in new - old]
+                             + [f"{names.get(n, n)} 켬" for n in names if n in old - new])
+        return f"{f.label} {_show(f, self.old)} → {_show(f, self.new)}"
 
 
 def _jsonable(v: Any) -> Any:
@@ -186,6 +224,9 @@ def _show(f: Field, v: Any) -> str:
     if f.type == "sessions":
         names = dict(_SESSION_OPTS)
         return "/".join(names.get(s, s) for s in v) or "없음"
+    if f.type == "off":
+        names = dict(f.options)
+        return ", ".join(names.get(n, n) for n in v) or "없음"
     if f.options:
         return dict(f.options).get(v, str(v))
     s = f"{v:,.6f}".rstrip("0").rstrip(".") if isinstance(v, float) else f"{v:,}"
@@ -205,6 +246,13 @@ def _coerce(f: Field, v: Any) -> Any:
         if any(s not in allowed for s in v):
             raise ValueError(f"{f.label}: PRE / REGULAR / AFTER 중에서 골라야 합니다")
         return [s for s in allowed if s in v]          # 순서 고정, 중복 제거
+    if f.type == "off":
+        names = [o for o, _ in f.options]
+        if not isinstance(v, list) or any(not isinstance(x, str) or x not in names for x in v):
+            raise ValueError(f"{f.label}: 알 수 없는 기능 이름입니다")
+        return [n for n in names if n in v]
+    if f.type == "toggle":
+        raise ValueError(f"{f.label}: 켬/끔은 off 목록으로 바꿉니다")
     if f.type == "select":
         allowed = [o for o, _ in f.options]
         if v not in allowed or isinstance(v, bool):
@@ -331,9 +379,10 @@ class LiveConfig:
     def params(self, section: str):
         return self._p[section]
 
-    ma = property(lambda self: self._p["ma_cross"])
-    order = property(lambda self: self._p["order"])
-    risk = property(lambda self: self._p["risk"])
+    # 매매에 쓰는 값 (꺼 둔 기능은 없는 것과 같은 값). 파일·화면에 있는 원래 값은 params(section)
+    ma = property(lambda self: self._p["ma_cross"].effective())
+    order = property(lambda self: self._p["order"].effective())
+    risk = property(lambda self: self._p["risk"].effective())
     fees = property(lambda self: self._p["fees"])
     tax = property(lambda self: self._p["tax"])
 
@@ -349,10 +398,12 @@ class LiveConfig:
             for f in FIELDS:
                 if f.group != g:
                     continue
+                p = self.params(f.section)
                 items.append({"id": f.id, "section": f.section, "key": f.key, "label": f.label, "type": f.type,
                               "apply": f.apply, "unit": f.unit, "help": f.help, "min": f.min, "max": f.max,
                               "step": f.step, "options": [{"value": v, "label": l} for v, l in f.options],
-                              "value": _jsonable(getattr(self.params(f.section), f.key))})
+                              "toggle": toggle_meta(f),
+                              "value": _jsonable(getattr(p, f.key)) if f.stored else p.uses(f.toggle)})
             groups.append({"title": g, "fields": items})
         return {"groups": groups, "file": self.path.name}
 
@@ -428,7 +479,7 @@ class LiveConfig:
 
     def _apply(self, new: dict[str, object], source: str) -> list[Change]:
         changes = [Change(f, getattr(self._p[f.section], f.key), getattr(new[f.section], f.key))
-                   for f in FIELDS
+                   for f in _STORED
                    if _jsonable(getattr(self._p[f.section], f.key)) != _jsonable(getattr(new[f.section], f.key))]
         self._p = new
         if not changes:

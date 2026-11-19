@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 from broker.account import AccountService
+from config.toggles import effective as _effective, parse_off, uses as _uses
 from core.api_client import KisClient
 from core.exceptions import KisApiError, KisError, KisNetworkError
 from core.notifier import NOTIFY
@@ -99,6 +100,11 @@ class Order:
                 f"{no} [{self.status.label}{fill}]")
 
 
+# 켜고 끌 수 있는 주문 규칙 (하루 최대 주문은 마지막 안전판이라 끌 수 없음)
+ORDER_TOGGLES = {"buys_per_symbol": "종목당 하루 매수 횟수"}
+_ORDER_ZERO_OFF = {"buys_per_symbol": "max_buys_per_symbol"}
+
+
 @dataclass(frozen=True)
 class OrderParams:
     slippage_pct: float = 0.3
@@ -110,6 +116,7 @@ class OrderParams:
     cancel_open_orders_on_start: bool = False
     dry_run: bool = False
     allow_real_trading: bool = False
+    off: tuple[str, ...] = ()                  # 꺼 둔 기능 (ORDER_TOGGLES 이름, 값은 남겨 둠)
 
     @classmethod
     def from_toml(cls, path: Path) -> OrderParams:
@@ -121,6 +128,9 @@ class OrderParams:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"[order]: 알 수 없는 설정 {sorted(unknown)}")
+        raw = dict(raw)
+        if "off" in raw:
+            raw["off"] = parse_off(raw["off"], ORDER_TOGGLES, "order")
         params = cls(**raw)
         if not 0 <= params.slippage_pct < 5:
             raise ValueError("slippage_pct 는 0 이상 5 미만이어야 합니다")
@@ -131,6 +141,13 @@ class OrderParams:
         if params.max_orders_per_day < 1:
             raise ValueError("max_orders_per_day 는 1 이상이어야 합니다")
         return params
+
+    def uses(self, name: str) -> bool:
+        return _uses(self, name, _ORDER_ZERO_OFF)
+
+    def effective(self) -> OrderParams:
+        """매매에 쓰는 값: 꺼진 기능은 0 (= 제한 없음)."""
+        return _effective(self, {n: {k: 0} for n, k in _ORDER_ZERO_OFF.items()})
 
 
 def _round_price(price: float) -> float:

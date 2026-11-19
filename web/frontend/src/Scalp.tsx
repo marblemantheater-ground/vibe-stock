@@ -11,7 +11,7 @@ type Trip = {
 type Summary = { trades: number; wins: number; win_rate: number | null; gross: number; fees: number; net: number;
   avg_hold_sec: number | null; fee_share_pct: number | null; best: number | null; worst: number | null };
 type PosRow = { symbol: string; qty: number; avg_price: number; price: number; pnl_pct: number | null; preset: string;
-  mode: string; mode_label: string; tp_price: number; sl_price: number; peak: number | null; trailing_on: boolean;
+  mode: string; mode_label: string; tp_price: number | null; sl_price: number | null; peak: number | null; trailing_on: boolean;
   trailing_stop: number | null; trailing_activate_price: number | null; held_sec: number | null;
   time_left_sec: number | null; flatten_at: string | null };
 type WatchRow = { symbol: string; price: number | null; change_rate: number | null; vwap: number | null; vs_vwap_pct: number | null;
@@ -46,16 +46,18 @@ function dist(v: number | null) {
 }
 
 function scalpChips(v: Record<string, SettingValue>, modes: Record<string, string>): string[] {
+  const off = new Set((v.off as string[] | undefined) ?? []);
+  const on = (name: string, key: string) => !off.has(name) && Number(v[key]) > 0;   // 꺼 둔 기능은 빼고
   const out = [modes[String(v.entry_mode)] ?? String(v.entry_mode), `${v.bar_minutes}분봉`];
   if (v.entry_mode === "breakout") out.push(`${v.breakout_bars}봉 고가`);
   if (v.entry_mode === "orb") out.push(`첫 ${v.orb_minutes}분`);
-  if (Number(v.volume_mult) > 0) out.push(`거래량 ${v.volume_mult}배↑`);
-  out.push(`익절 ${v.take_profit_pct}%`, `손절 ${v.stop_loss_pct}%`);
-  if (Number(v.trailing_activate_pct) > 0) out.push(`추적 +${v.trailing_activate_pct}%/−${v.trailing_pct}%`);
-  if (Number(v.max_hold_min) > 0) out.push(`최대 ${v.max_hold_min}분`);
-  if (Number(v.flatten_before_close_min) > 0) out.push(`마감 ${v.flatten_before_close_min}분 전 정리`);
-  if (Number(v.min_strength) > 0) out.push(`체결강도 ${v.min_strength}↑`);
-  if (Number(v.max_spread_pct) > 0) out.push(`스프레드 ${v.max_spread_pct}%↓`);
+  if (on("volume", "volume_mult")) out.push(`거래량 ${v.volume_mult}배↑`);
+  out.push(off.has("take_profit") ? "익절 끔" : `익절 ${v.take_profit_pct}%`, off.has("stop_loss") ? "손절 끔" : `손절 ${v.stop_loss_pct}%`);
+  if (on("trailing", "trailing_activate_pct")) out.push(`추적 +${v.trailing_activate_pct}%/−${v.trailing_pct}%`);
+  if (on("max_hold", "max_hold_min")) out.push(`최대 ${v.max_hold_min}분`);
+  if (on("flatten", "flatten_before_close_min")) out.push(`마감 ${v.flatten_before_close_min}분 전 정리`);
+  if (on("strength", "min_strength")) out.push(`체결강도 ${v.min_strength}↑`);
+  if (on("spread", "max_spread_pct")) out.push(`스프레드 ${v.max_spread_pct}%↓`);
   return out;
 }
 
@@ -219,8 +221,8 @@ export default function Scalp() {
                     <td><b>{p.symbol}</b> <span className="muted small">{p.qty}주 @ {usd(p.avg_price)}</span></td>
                     <td>{p.preset}<div className="muted small">{p.mode_label}</div></td>
                     <td className={`r num tone-${tone(p.pnl_pct)}`}>{pct(p.pnl_pct)}</td>
-                    <td className="r num">{usd(p.sl_price)}</td>
-                    <td className="r num">{usd(p.tp_price)}</td>
+                    <td className="r num">{p.sl_price === null ? <span className="muted">끔</span> : usd(p.sl_price)}</td>
+                    <td className="r num">{p.tp_price === null ? <span className="muted">끔</span> : usd(p.tp_price)}</td>
                     <td className="r num">{p.trailing_on ? <b>{usd(p.trailing_stop)}</b> : p.trailing_activate_price ? <span className="muted">{usd(p.trailing_activate_price)}↑ 시 켜짐</span> : <span className="muted">끔</span>}
                       {p.peak ? <div className="muted small">고점 {usd(p.peak)}</div> : null}</td>
                     <td className="r num">{dur(p.held_sec)}</td>

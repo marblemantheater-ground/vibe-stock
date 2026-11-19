@@ -33,6 +33,7 @@ from typing import Callable
 
 from broker.account import AccountService, AccountSnapshot
 from broker.order import OrderManager
+from config.toggles import effective as _effective, parse_off, uses as _uses
 from core.exceptions import KisError
 from core.notifier import NOTIFY
 from market.clock import KST
@@ -70,6 +71,10 @@ class HaltKind(str, Enum):
         return self in (HaltKind.DAILY_LOSS, HaltKind.DAILY_TARGET)
 
 
+RISK_TOGGLES = {"daily_loss": "하루 손실 한도", "max_drawdown": "최대 낙폭 한도"}
+_RISK_ZERO_OFF = {"daily_loss": "daily_loss_limit_pct", "max_drawdown": "max_drawdown_pct"}
+
+
 @dataclass(frozen=True)
 class RiskParams:
     daily_loss_limit_pct: float = 5.0      # 0 = 끔
@@ -78,6 +83,7 @@ class RiskParams:
     max_drawdown_action: str = "block_buys"
     confirm_sec: float = 10.0              # 한도 초과가 이 시간 동안 이어져야 발동 (순간적인 이상 시세 무시)
     liquidation_slippage_pct: float = 1.0  # 청산 매도 지정가 = 현재가 - 1% (빨리 체결되도록 일반 주문보다 넓게)
+    off: tuple[str, ...] = ()              # 꺼 둔 한도 (RISK_TOGGLES 이름, 값은 남겨 둠)
 
     @classmethod
     def from_toml(cls, path: Path) -> RiskParams:
@@ -89,6 +95,9 @@ class RiskParams:
         unknown = set(raw) - {f.name for f in fields(cls)}
         if unknown:
             raise ValueError(f"[risk]: 알 수 없는 설정 {sorted(unknown)}")
+        raw = dict(raw)
+        if "off" in raw:
+            raw["off"] = parse_off(raw["off"], RISK_TOGGLES, "risk")
         p = cls(**raw)
         if not 0 <= p.daily_loss_limit_pct < 100 or not 0 <= p.max_drawdown_pct < 100:
             raise ValueError("[risk] daily_loss_limit_pct, max_drawdown_pct 는 0 이상 100 미만이어야 합니다 (0 = 끔)")
@@ -98,6 +107,13 @@ class RiskParams:
         if p.confirm_sec < 0 or not 0 <= p.liquidation_slippage_pct < 10:
             raise ValueError("[risk] confirm_sec >= 0, 0 <= liquidation_slippage_pct < 10 이어야 합니다")
         return p
+
+    def uses(self, name: str) -> bool:
+        return _uses(self, name, _RISK_ZERO_OFF)
+
+    def effective(self) -> RiskParams:
+        """매매에 쓰는 값: 꺼진 한도는 0 (= 끔)."""
+        return _effective(self, {n: {k: 0.0} for n, k in _RISK_ZERO_OFF.items()})
 
     def action_for(self, kind: HaltKind) -> str:
         if kind in (HaltKind.KILL, HaltKind.DAILY_TARGET):   # 목표 달성: 전부 팔아 수익 확정

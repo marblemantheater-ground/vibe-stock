@@ -1,6 +1,6 @@
 # 거래 옵션 — 대시보드 '거래 옵션' 탭에서 관리한다. active 가 지금 켜진 옵션.
 # 각 옵션은 전략 값([ma_cross]) 묶음. 켜면 config/strategy.toml [ma_cross] 에 들어간다.
-active = "p1"
+active = "p2"
 
 [presets.p1]
 name = "거래옵션1"
@@ -25,6 +25,37 @@ rebuy_wait_sec = 0
 entry_mode = "ma_cross"
 breakout_bars = 20
 orb_minutes = 15
+volume_mult = 0.0
+trailing_activate_pct = 0.0
+trailing_pct = 1.0
+max_hold_min = 0
+flatten_before_close_min = 0
+min_strength = 0.0
+max_spread_pct = 0.0
+
+[presets.p2]
+name = "거래옵션2"
+description = ""
+created_at = "2026-11-19T11:19:27+09:00"
+updated_at = "2026-11-19T11:25:50+09:00"
+bar_minutes = 1
+short_window = 5
+long_window = 20
+min_change_rate = 0.0
+max_change_rate = 5.0
+take_profit_pct = 3.0
+stop_loss_pct = 2.0
+budget_per_trade_usd = 1000
+capital_usage_pct = 100.0
+max_positions = 5
+cooldown_sec = 300
+sessions = ["PRE", "REGULAR"]
+daily_profit_target_pct = 5.0
+max_buys_per_day = 50
+rebuy_wait_sec = 30
+entry_mode = "ma_cross"
+breakout_bars = 5
+orb_minutes = 10
 volume_mult = 0.0
 trailing_activate_pct = 0.0
 trailing_pct = 1.0

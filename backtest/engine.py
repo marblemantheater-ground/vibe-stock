@@ -103,7 +103,8 @@ def _path(bar: Bar) -> list[float]:
 class Backtest:
     def __init__(self, bt: BacktestParams, ma: MaCrossParams, order: OrderParams, risk: RiskParams, fees: FeeParams,
                  store: MinuteStore, progress: Callable[[float], None] | None = None):
-        self.bt, self.ma, self.order, self.risk, self.fees = bt, ma, order, risk, fees
+        # 꺼 둔 기능은 실제 매매와 같게 '없는 것과 같은 값'으로 (config/toggles.py)
+        self.bt, self.ma, self.order, self.risk, self.fees = bt, ma.effective(), order.effective(), risk.effective(), fees
         self.store = store
         self.progress = progress or (lambda _p: None)
         self.clock = MarketClock()
@@ -264,10 +265,12 @@ class Backtest:
             prices = _path(bar)
             pos = positions.get(sym)
             if pos and trading:   # 봉 안에서 익절·손절가를 지나가면 그 가격 틱을 끼워 넣는다
-                tp, sl = pos.avg_price * (1 + tp_pct / 100) * (1 + 1e-9), pos.avg_price * (1 - sl_pct / 100) * (1 - 1e-9)
+                levels = [pos.avg_price * (1 + tp_pct / 100) * (1 + 1e-9)] if tp_pct else []   # 0 = 익절·손절 끔
+                if sl_pct:
+                    levels.append(pos.avg_price * (1 - sl_pct / 100) * (1 - 1e-9))
                 path = [prices[0]]
                 for a, b in zip(prices, prices[1:]):
-                    for lvl in sorted((x for x in (tp, sl) if min(a, b) < x < max(a, b)), reverse=a > b):
+                    for lvl in sorted((x for x in levels if min(a, b) < x < max(a, b)), reverse=a > b):
                         path.append(lvl)
                     path.append(b)
                 prices = path

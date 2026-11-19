@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { BtRunSummary, Coverage, SettingField, SettingValue } from "./types";
-import { FieldRow, parse, same, show } from "./Settings";
+import { SettingRow, isOn, offDiff, parse, same, show } from "./Settings";
 import { Dialog } from "./Controls";
 import { pct, tone, usd } from "./format";
 
@@ -17,7 +17,7 @@ type Editing = { mode: "new" | "edit"; id?: string; name: string; description: s
 
 const H = { "Content-Type": "application/json", "X-Vibe-Control": "1" };
 const KEY_ROWS = ["entry_mode", "bar_minutes", "short_window", "long_window", "min_change_rate", "max_change_rate", "take_profit_pct",
-  "stop_loss_pct", "capital_usage_pct", "max_positions", "sessions", "daily_profit_target_pct", "max_buys_per_day", "rebuy_wait_sec"];
+  "stop_loss_pct", "capital_usage_pct", "max_positions", "sessions", "daily_profit_target_pct", "max_buys_per_day", "rebuy_wait_sec", "off"];
 
 // 거래 옵션: 전략 값 묶음을 여러 개 두고 하나만 켠다. 보유 종목은 산 때 옵션 기준으로 판다.
 export default function Presets() {
@@ -122,7 +122,8 @@ export default function Presets() {
             <dl className="preset-values">
               {KEY_ROWS.filter((k) => byKey[k]).map((k) => (
                 <div key={k} className={!p.active && !same(p.values[k], active.values[k]) ? "diff" : ""}>
-                  <dt>{byKey[k].label}</dt><dd className="num">{show(byKey[k], p.values[k])}</dd>
+                  <dt>{byKey[k].label}</dt>
+                  <dd className="num">{isOn(byKey[k], (x) => p.values[x]) ? show(byKey[k], p.values[k]) : <span className="muted">끔</span>}</dd>
                 </div>
               ))}
             </dl>
@@ -223,11 +224,17 @@ export default function Presets() {
 }
 
 function ActivateDiff({ from, to, fields, trading }: { from: Preset; to: Preset; fields: SettingField[]; trading: boolean }) {
-  const diffs = fields.filter((f) => !same(from.values[f.key], to.values[f.key]));
+  const diffs = fields.filter((f) => f.type !== "toggle" && !same(from.values[f.key], to.values[f.key]));
   if (!diffs.length) return <p className="small">지금 옵션과 전략 값이 같습니다. 켜진 옵션 이름만 바뀝니다.</p>;
   return (
     <ul className="change-list">
-      {diffs.map((f) => (
+      {diffs.map((f) => f.type === "off" ? offDiff(f, from.values.off, to.values.off).map((d) => (
+        <li key={`off.${d.name}`}>
+          <span>{d.label}</span>
+          <span className="num"><span className="muted">{d.on ? "끔" : "켬"}</span> → <strong>{d.on ? "켬" : "끔"}</strong></span>
+          <span className={`pill tone-${trading ? "good" : "idle"}`}>{trading ? "바로 적용" : "다음 세션부터"}</span>
+        </li>
+      )) : (
         <li key={f.key}>
           <span>{f.label}</span>
           <span className="num"><span className="muted">{show(f, from.values[f.key])}</span> → <strong>{show(f, to.values[f.key])}</strong></span>
@@ -249,7 +256,8 @@ function EditDialog({ editing, fields, isActive, busy, onCancel, onSave }: {
     const values: Record<string, SettingValue> = {};
     const errors: Record<string, string> = {};
     for (const f of fields) {
-      const p = parse(f, e.draft[f.key]);
+      if (f.type === "toggle") continue;   // 켬/끔은 off 목록으로
+      const p = parse(f, e.draft[f.key] ?? f.value);
       if (p.error) errors[f.key] = p.error;
       else values[f.key] = p.value!;
     }
@@ -266,9 +274,10 @@ function EditDialog({ editing, fields, isActive, busy, onCancel, onSave }: {
       </div>
       <div className="fields preset-fields">
         {fields.map((f) => (
-          <FieldRow key={f.key} f={{ ...f, id: `preset-${f.key}`, apply: "now" }} value={e.draft[f.key]} error={errors[f.key]}
-                    changed={editing.mode === "edit" && !same(values[f.key] ?? e.draft[f.key], editing.draft[f.key])}
-                    onChange={(v) => setE({ ...e, draft: { ...e.draft, [f.key]: v } })} />
+          <SettingRow key={f.key} f={{ ...f, apply: "now" }} idPrefix="preset" error={errors[f.key]}
+                      get={(k) => e.draft[k]} orig={(k) => editing.draft[k]}
+                      changed={editing.mode === "edit" && f.type !== "toggle" && !same(values[f.key] ?? e.draft[f.key], editing.draft[f.key])}
+                      onSet={(vals) => setE((cur) => ({ ...cur, draft: { ...cur.draft, ...vals } }))} />
         ))}
       </div>
       {isActive && <p className="muted small">켜져 있는 옵션입니다. 저장하면 바뀐 값이 실행 중인 매매에 바로 적용됩니다 (봉 단위·이평 기간은 다음 거래일부터).</p>}

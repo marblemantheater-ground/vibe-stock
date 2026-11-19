@@ -56,7 +56,7 @@ from backtest.runs import RunStore, run_backtest
 from market.minute import MinuteStore, collect_minutes
 from report.annual import available_years, compute_annual, log_annual, save_annual
 from report.settlement import SettlementStore, log_report, settle_day
-from strategy.ma_cross import MovingAverageCrossStrategy
+from strategy.ma_cross import TOGGLES as MA_TOGGLES, MovingAverageCrossStrategy
 from strategy.positions import PositionBook
 from strategy.screener import ScreenerParams, run_screen
 from web.server import DashboardParams, DashboardServer
@@ -324,7 +324,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         # 봉 단위·이동평균 기간은 오늘 쌓은 봉과 맞물려 있어 그대로 두고 (다음 거래일부터), 나머지는 바로 적용
         new = replace(c.ma, bar_minutes=params.bar_minutes, short_window=params.short_window,
                       long_window=params.long_window)
-        if {ch.field.key for ch in changes} & {"capital_usage_pct", "budget_per_trade_usd", "max_positions"}:
+        keys = {ch.field.key for ch in changes if ch.field.section == "ma_cross"}
+        if keys & {"capital_usage_pct", "budget_per_trade_usd", "max_positions", "off"}:   # off: 사용 비율·종목 수 켬/끔
             new = new.with_budget_from(start_snap.orderable_usd if start_snap else None)   # 시작 시 주문가능 USD 기준
         else:
             new = replace(new, budget_per_trade_usd=params.budget_per_trade_usd)
@@ -641,10 +642,14 @@ async def main(argv: list[str] | None = None) -> int:
         log.critical("매매 대상 종목이 없습니다: %s", _WATCHLIST_PATH)
         return 2
     log.info("매매 대상 %d종목: %s", len(watchlist), ", ".join(w.symbol for w in watchlist))
-    log.info("전략: 이동평균 돌파 (%d분봉 MA%d/MA%d, 등락률 %.1f~%.1f%%, 익절 %.1f%% 손절 %.1f%%, 세션 %s)",
+    log.info("전략: 이동평균 돌파 (%d분봉 MA%d/MA%d, %s, %s %s, 세션 %s)",
              params.bar_minutes, params.short_window, params.long_window,
-             params.min_change_rate, params.max_change_rate, params.take_profit_pct,
-             params.stop_loss_pct, "/".join(s.label for s in params.sessions))
+             f"등락률 {params.min_change_rate:.1f}~{params.max_change_rate:.1f}%" if params.uses("change_rate") else "등락률 제한 끔",
+             f"익절 {params.take_profit_pct:.1f}%" if params.take_profit_pct else "익절 끔",
+             f"손절 {params.stop_loss_pct:.1f}%" if params.stop_loss_pct else "손절 끔",
+             "/".join(s.label for s in params.sessions))
+    if params.off:
+        log.info("꺼 둔 기능: %s", ", ".join(MA_TOGGLES[n] for n in params.off))
     if order_params.dry_run or (settings.is_real and not order_params.allow_real_trading):
         log.warning("주문 모드: 미전송 (신호만 기록) — config/strategy.toml [order] 확인")
     else:

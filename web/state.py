@@ -286,8 +286,10 @@ class DashboardState:
                 "change_rate": _r(tick.change_rate) if tick else None,
                 "eval": _r(h.quantity * price), "pnl": _r((price - h.avg_price) * h.quantity),
                 "pnl_pct": _r(pnl_pct),
-                "tp_price": _r(h.avg_price * (1 + tp / 100), 4), "sl_price": _r(h.avg_price * (1 - sl / 100), 4),
-                "to_tp_pct": _r(tp - pnl_pct), "to_sl_pct": _r(pnl_pct + sl),
+                # 익절·손절을 끈 옵션이면 None (0 = 그 기준으로 팔지 않음)
+                "tp_price": _r(h.avg_price * (1 + tp / 100), 4) if tp else None,
+                "sl_price": _r(h.avg_price * (1 - sl / 100), 4) if sl else None,
+                "to_tp_pct": _r(tp - pnl_pct) if tp else None, "to_sl_pct": _r(pnl_pct + sl) if sl else None,
                 "live": tick is not None,
                 "preset": rule.preset_name if rule else current, "preset_recorded": rule is not None,
             })
@@ -339,6 +341,7 @@ class DashboardState:
             "take_profit_pct": p.take_profit_pct, "stop_loss_pct": p.stop_loss_pct,
             "budget_per_trade_usd": _r(p.budget_per_trade_usd), "max_positions": p.max_positions,
             "sessions": [s.label for s in p.sessions],
+            "off": list(p.off),   # 꺼 둔 기능 (이 값들은 화면에 '끔'으로)
             "preset": self.presets.active_name if self.presets else None,
         }
 

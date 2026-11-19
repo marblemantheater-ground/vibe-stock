@@ -5,6 +5,7 @@ import Controls from "./Controls";
 
 export default function Live({ snap }: { snap: Snapshot }) {
   const a = snap.account;
+  const off = new Set(snap.strategy.off ?? []);
   return (
     <div className="live">
       <Controls snap={snap} />
@@ -17,7 +18,7 @@ export default function Live({ snap }: { snap: Snapshot }) {
       </section>
 
       <Panel title="보유 종목" count={snap.positions.length}
-             note={`익절 +${snap.strategy.take_profit_pct}% · 손절 −${snap.strategy.stop_loss_pct}%`}>
+             note={`${off.has("take_profit") ? "익절 끔" : `익절 +${snap.strategy.take_profit_pct}%`} · ${off.has("stop_loss") ? "손절 끔" : `손절 −${snap.strategy.stop_loss_pct}%`}`}>
         <Positions rows={snap.positions} />
       </Panel>
 
@@ -31,7 +32,7 @@ export default function Live({ snap }: { snap: Snapshot }) {
       </div>
 
       <Panel title="감시 종목" count={snap.watch.length}
-             note={`${snap.strategy.bar_minutes}분봉 MA${snap.strategy.short_window}/MA${snap.strategy.long_window} · 등락률 ${snap.strategy.min_change_rate}~${snap.strategy.max_change_rate}% · 1회 ${usd(snap.strategy.budget_per_trade_usd)} · 최대 ${snap.strategy.max_positions}종목 · ${snap.strategy.sessions.join("/")}`}>
+             note={`${snap.strategy.bar_minutes}분봉 MA${snap.strategy.short_window}/MA${snap.strategy.long_window} · ${off.has("change_rate") ? "등락률 제한 끔" : `등락률 ${snap.strategy.min_change_rate}~${snap.strategy.max_change_rate}%`} · 1회 ${usd(snap.strategy.budget_per_trade_usd)} · ${snap.strategy.max_positions ? `최대 ${snap.strategy.max_positions}종목` : "종목 수 제한 없음"} · ${snap.strategy.sessions.join("/")}`}>
         <WatchTable rows={snap.watch} phase={snap.status.phase} />
       </Panel>
     </div>
@@ -65,7 +66,7 @@ function RiskGauges({ risk }: { risk: Risk }) {
         </div>
       )}
       <div className="kpi-sub limits-line">
-        매수 {l.buys_today}{l.max_buys ? `/${l.max_buys}회` : "회"} · 보유 {l.positions}/{l.max_positions}종목
+        매수 {l.buys_today}{l.max_buys ? `/${l.max_buys}회` : "회"} · 보유 {l.positions}{l.max_positions ? `/${l.max_positions}` : ""}종목
       </div>
     </div>
   );
@@ -135,6 +136,13 @@ function Positions({ rows }: { rows: Position[] }) {
 
 // 손절가(왼쪽)~익절가(오른쪽) 사이에서 현재 수익률 위치
 function ExitMeter({ p }: { p: Position }) {
+  if (p.to_tp_pct === null || p.to_sl_pct === null)   // 익절 또는 손절을 끈 옵션
+    return (
+      <span className="num small">
+        <span className="tone-down">{p.to_sl_pct === null ? "손절 끔" : `손절까지 ${p.to_sl_pct.toFixed(1)}%`}</span>{" · "}
+        <span className="tone-up">{p.to_tp_pct === null ? "익절 끔" : `익절까지 ${p.to_tp_pct.toFixed(1)}%`}</span>
+      </span>
+    );
   const span = p.to_tp_pct + p.to_sl_pct;
   const pos = span > 0 ? Math.min(Math.max(p.to_sl_pct / span, 0), 1) : 0.5;
   return (

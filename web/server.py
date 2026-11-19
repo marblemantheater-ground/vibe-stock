@@ -350,8 +350,8 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         """템플릿으로 거래 옵션 만들기 (켜지는 않는다 → 백테스트 후 거래 옵션 탭이나 여기서 켜기)."""
         guarded(request)
         try:
-            name, desc, values = template_values(key)
             ps = presets_or_400()
+            name, desc, values = template_values(key, ps.presets[ps.active_id].get("off") or [])
             names = {p["name"] for p in ps.presets.values()}
             final, n = name, 2
             while final in names:

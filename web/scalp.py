@@ -102,7 +102,7 @@ def scalp_view(state, presets_items: list[dict]) -> dict:
     rt = round_trip_fee_pct(fees)
     order_p = cfg.order if cfg else None
     warnings = []
-    if p.is_scalp and p.take_profit_pct <= rt * 2:
+    if p.is_scalp and p.take_profit_pct and p.take_profit_pct <= rt * 2:
         warnings.append(f"익절 {p.take_profit_pct:g}% 가 왕복 수수료 {rt:.2f}%의 2배 이하입니다. 이겨도 수수료로 대부분 사라집니다.")
     if order_p and order_p.max_buys_per_symbol == 1:
         warnings.append("주문 설정의 '종목당 하루 매수 횟수'가 1회라 같은 종목을 같은 날 다시 살 수 없습니다 "
@@ -139,8 +139,8 @@ def scalp_view(state, presets_items: list[dict]) -> dict:
             "pnl_pct": round((price / h.avg_price - 1) * 100, 3) if h.avg_price else None,
             "preset": rule.preset_name if rule else (state.presets.active_name if state.presets else ""),
             "mode": r.entry_mode, "mode_label": ENTRY_MODES.get(r.entry_mode, r.entry_mode),
-            "tp_price": round(h.avg_price * (1 + r.take_profit_pct / 100), 4),
-            "sl_price": round(h.avg_price * (1 - r.stop_loss_pct / 100), 4),
+            "tp_price": round(h.avg_price * (1 + r.take_profit_pct / 100), 4) if r.take_profit_pct else None,   # 끔 = None
+            "sl_price": round(h.avg_price * (1 - r.stop_loss_pct / 100), 4) if r.stop_loss_pct else None,
             "peak": round(peak, 4) if peak else None, "trailing_on": trail_on,
             "trailing_stop": round(peak * (1 - r.trailing_pct / 100), 4) if trail_on else None,
             "trailing_activate_price": round(h.avg_price * (1 + r.trailing_activate_pct / 100), 4) if r.trailing_activate_pct else None,
@@ -169,6 +169,7 @@ def scalp_view(state, presets_items: list[dict]) -> dict:
 
     active = {k: (list(getattr(p, k)) if k == "sessions" else getattr(p, k)) for k in SCALP_KEYS}
     active["sessions"] = [s.value for s in p.sessions]
+    active["off"] = list(p.off)
     return {
         "trading": state.phase == "trading", "env": state.env,
         "preset": state.presets.active_name if state.presets else None,
@@ -185,9 +186,14 @@ def scalp_view(state, presets_items: list[dict]) -> dict:
     }
 
 
-def template_values(key: str) -> tuple[str, str, dict]:
+def template_values(key: str, base_off: list[str] | tuple[str, ...] = ()) -> tuple[str, str, dict]:
+    """템플릿 값. base_off(바탕이 되는 켜진 옵션의 꺼 둔 기능) 중 템플릿이 값을 정하는 기능은 켠다."""
     t = TEMPLATES.get(key)
     if t is None:
         raise ValueError("없는 템플릿입니다")
-    MaCrossParams.from_dict({**{k: v for k, v in replace(MaCrossParams()).__dict__.items()}, **t["values"]})   # 검증
-    return t["name"], t["description"], t["values"]
+    from config.live import FIELDS   # 순환 import 방지
+    toggle_of = {f.key: f.toggle for f in FIELDS if f.section == "ma_cross" and f.toggle}
+    turned_on = {toggle_of[k] for k in t["values"] if k in toggle_of}
+    values = {**t["values"], "off": [n for n in base_off if n not in turned_on]}
+    MaCrossParams.from_dict({**{k: v for k, v in replace(MaCrossParams()).__dict__.items()}, **values})   # 검증
+    return t["name"], t["description"], values
