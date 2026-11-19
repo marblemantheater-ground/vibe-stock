@@ -24,6 +24,7 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
           <div className="brand-row">
             <span className="brand">vibe-stock</span>
             {s && <span className={`chip env-${s.env}`}>{s.env === "real" ? "실전" : "모의투자"}</span>}
+            {snap?.strategy.preset && <a href="#presets" className="chip chip-plain chip-link" title="지금 켜진 거래 옵션">{snap.strategy.preset}</a>}
             {s && s.dry_run !== null && (
               <span className={`chip ${s.dry_run ? "chip-warn" : "chip-plain"}`}>{s.dry_run ? "주문 미전송" : "주문 전송"}</span>
             )}
@@ -32,6 +33,8 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
             <a href="#live" className={tab === "live" ? "on" : ""}>실시간</a>
             <a href="#reports" className={tab === "reports" ? "on" : ""}>정산</a>
             <a href="#backtest" className={tab === "backtest" ? "on" : ""}>백테스트</a>
+            <a href="#presets" className={tab === "presets" ? "on" : ""}>거래 옵션</a>
+            <a href="#scalp" className={tab === "scalp" ? "on" : ""}>스캘핑</a>
             <a href="#settings" className={tab === "settings" ? "on" : ""}>설정</a>
           </nav>
           <div className="status-row">
@@ -58,8 +61,8 @@ export default function Header({ snap, link, tab, onLogout }: Props) {
         </div>
       </header>
       {halt && (
-        <div className="halt-banner" role="alert">
-          <strong>매매 중지 · {halt.label}</strong>
+        <div className={`halt-banner ${halt.kind === "DAILY_TARGET" ? "good" : ""}`} role="alert">
+          <strong>{halt.kind === "DAILY_TARGET" ? "오늘 매매 종료 · 하루 목표 달성" : `매매 중지 · ${halt.label}`}</strong>
           <span>{halt.reason}</span>
           <span className="muted">{kstTime(halt.since)} 부터 · 해제: 실시간 탭의 재개 버튼</span>
         </div>

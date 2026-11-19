@@ -123,6 +123,7 @@ export default function Settings() {
       <section className={`settings-intro ${real ? "real" : ""}`}>
         <div>
           <strong>저장하면 {view.trading ? "지금 매매에 바로 적용됩니다" : "다음 세션부터 적용됩니다"}</strong>
+          {view.preset && <span className="small"> · 전략 값은 켜진 거래 옵션 <a href="#presets">'{view.preset}'</a>에 함께 저장됩니다</span>}
           <span className="muted small">
             {" "}config/{view.file} 에 기록됩니다 (주석은 그대로). 파일을 직접 고쳐도 몇 초 안에 반영됩니다.
             봉 단위·이동평균 기간은 그날 쌓은 봉과 맞물려 있어 다음 거래일부터 적용됩니다.

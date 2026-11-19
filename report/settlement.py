@@ -35,6 +35,7 @@ _CSV_ENCODING = "utf-8-sig"
 TRADE_FIELDS = [
     "date", "placed_at", "symbol", "exchange", "side", "qty", "limit_price", "status", "odno",
     "filled_qty", "avg_fill_price", "fill_amount", "cost_basis", "realized_pnl", "reason", "message",
+    "preset",   # 거래 옵션 이름 (매수: 그때 켜진 옵션, 매도: 그 종목을 산 옵션)
 ]
 SUMMARY_FIELDS = [
     "date", "env", "orders", "filled_orders", "buy_amount", "sell_amount", "realized_pnl",
@@ -76,6 +77,7 @@ def trade_row(order: Order, trading_date: date) -> dict:
         "realized_pnl": realized,
         "reason": order.signal.reason,
         "message": order.message,
+        "preset": (getattr(order.signal, "meta", None) or {}).get("preset_name", ""),
     }
 
 
@@ -187,6 +189,16 @@ class SettlementStore:
         path = self.trades_path(d)
         path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not path.exists()
+        if not new_file:   # 예전 형식(칸이 적은 머리글) 파일이면 새 머리글로 다시 쓴 뒤 이어 쓴다
+            with path.open(encoding=_CSV_ENCODING, newline="") as f:
+                reader = csv.DictReader(f)
+                old_rows, header = list(reader), reader.fieldnames
+            if header != TRADE_FIELDS:
+                def rewrite(f):
+                    w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+                    w.writeheader()
+                    w.writerows(old_rows)
+                _atomic_write(path, rewrite)
         with path.open("a", encoding=_CSV_ENCODING if new_file else "utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
             if new_file:
@@ -245,6 +257,34 @@ class SettlementStore:
             w.writeheader()
             w.writerows(rows[k] for k in sorted(rows))
         _atomic_write(self.summary_path, write)
+
+
+def preset_performance(store: SettlementStore) -> dict[str, dict]:
+    """거래 옵션별 실제 매매 성적 (매도 체결 기준: 그 종목을 산 옵션으로 집계)."""
+    folder = store.trades_path(date.today()).parent
+    out: dict[str, dict] = {}
+    for path in sorted(folder.glob("*.csv")) if folder.exists() else []:
+        try:
+            d = date.fromisoformat(path.stem)
+        except ValueError:
+            continue
+        latest: dict[str, dict] = {}
+        for r in store.load_trades(d):   # 재시작으로 같은 주문이 두 번 기록됐으면 마지막 것만
+            latest[r.get("odno", "").lstrip("0") or f"{id(r)}"] = r
+        for r in latest.values():
+            name = r.get("preset") or ""
+            if not name or not _num(r.get("filled_qty")):
+                continue
+            e = out.setdefault(name, {"buys": 0, "sells": 0, "wins": 0, "realized_pnl": 0.0, "first": r["date"], "last": r["date"]})
+            e["last"] = max(e["last"], r["date"])
+            if r["side"] == "BUY":
+                e["buys"] += 1
+            elif r.get("realized_pnl", "") != "":
+                pnl = _num(r["realized_pnl"])
+                e["sells"] += 1
+                e["wins"] += pnl > 0
+                e["realized_pnl"] = round(e["realized_pnl"] + pnl, 2)
+    return out
 
 
 async def settle_day(store: SettlementStore, account: AccountService, orders: list[Order],

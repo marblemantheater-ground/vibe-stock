@@ -38,6 +38,7 @@ if sys.version_info < (3, 11):  # asyncio.wait_for 의 TimeoutError 동작 등 3
 from broker.account import AccountService, AccountSnapshot, Holding
 from broker.order import OrderManager, OrderParams
 from config.live import Change, LiveConfig
+from config.presets import PresetStore
 from config.settings import BASE_DIR, load_settings
 from core.api_client import KisClient
 from core.exceptions import KisApiError, KisAuthError, KisError
@@ -56,6 +57,7 @@ from market.minute import MinuteStore, collect_minutes
 from report.annual import available_years, compute_annual, log_annual, save_annual
 from report.settlement import SettlementStore, log_report, settle_day
 from strategy.ma_cross import MovingAverageCrossStrategy
+from strategy.positions import PositionBook
 from strategy.screener import ScreenerParams, run_screen
 from web.server import DashboardParams, DashboardServer
 from web.state import DashboardState
@@ -143,9 +145,10 @@ class TickReporter:
 class AccountContext:
     """전략에 계좌 상태를 읽기 전용으로 제공 (잔고 스냅샷 + 진행 중인 매수 주문)."""
 
-    def __init__(self, account: AccountService, orders: OrderManager):
+    def __init__(self, account: AccountService, orders: OrderManager, book: PositionBook | None = None):
         self._account = account
         self._orders = orders
+        self._book = book
 
     def position(self, symbol: str) -> Holding | None:
         snap = self._account.snapshot
@@ -155,6 +158,23 @@ class AccountContext:
         snap = self._account.snapshot
         held = set(snap.holdings) if snap else set()
         return len(held | self._orders.pending_buy_symbols())   # 체결 대기 중인 매수도 보유로 계산
+
+    def buys_today(self) -> int:
+        """오늘 이 프로그램이 낸 매수 횟수 (체결됐거나 진행 중인 것. 체결 없이 취소·거부된 주문은 제외)."""
+        return sum(self._orders.buys_today(s) for s in {o.symbol for o in self._orders.orders})
+
+    def last_sell_at(self, symbol: str) -> datetime | None:
+        return self._orders.last_sell_at(symbol)
+
+    def entry_time(self, symbol: str) -> datetime | None:
+        """보유 종목을 산 시각 (시간 청산용): 오늘 매수 체결 시각 → 없으면 산 옵션 기록의 매수 시각."""
+        if (t := self._orders.last_buy_at(symbol)):
+            return t
+        rec = self._book.entries().get(symbol) if self._book else None
+        try:
+            return datetime.fromisoformat(rec["bought_at"]) if rec else None
+        except (KeyError, ValueError):
+            return None
 
 
 async def warm_up(client: KisClient, strategy: MovingAverageCrossStrategy,
@@ -172,6 +192,11 @@ async def warm_up(client: KisClient, strategy: MovingAverageCrossStrategy,
         strategy.seed(item.symbol, bars)
         log.info("[%s] 과거 %d분봉 %d개 로드 (전략 준비 %s)", item.symbol, strategy.p.bar_minutes,
                  len(bars), "완료" if strategy.ready(item.symbol) else "부족")
+        if minutes := strategy.exit_minutes(item.symbol):   # 산 옵션의 봉 단위가 다르면 데드크로스용 봉도
+            try:
+                strategy.seed_exit(item.symbol, await fetch_minute_bars(client, item, minutes))
+            except KisError as e:
+                log.warning("[%s] 산 옵션 기준 %d분봉 조회 실패 → 실시간 봉으로 채움: %s", item.symbol, minutes, e)
 
     await asyncio.gather(*(one(item) for item in watchlist))
 
@@ -261,7 +286,8 @@ class HoldingWatcher:
 
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
                         watchlist: list[WatchItem], cfg: LiveConfig, store: SettlementStore, risk_store: RiskStore,
-                        until: datetime | timedelta, dash: DashboardState | None = None) -> None:
+                        until: datetime | timedelta, dash: DashboardState | None = None,
+                        presets: PresetStore | None = None, book: PositionBook | None = None) -> None:
     """until 시각까지 (timedelta 면 준비가 끝난 시점부터 그 시간 동안) 실시간 시세를 받아 전략을 실행하고 주문한다.
     거래일마다 전략·주문 관리자를 새로 만들고, 끝날 때(오류·중단 포함) 미체결 취소 후 정산한다.
     도중에 설정이 바뀌면(대시보드·파일 수정) 봉 단위·이동평균 기간을 뺀 나머지를 바로 반영한다."""
@@ -276,10 +302,22 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
     except KisError as e:
         log.warning("기존 미체결 주문 조회 실패 (계속 진행, 중복 주문 주의): %s", e)
     guard = RiskGuard(cfg.risk, risk_store, account, orders, trading_date, order_params.order_timeout_sec)
-    await guard.start(guard.equity())
+    await guard.start(guard.equity(), start_cash=start_snap.orderable_usd if start_snap else None)
     watchlist, targets = build_trading_list(clock, watchlist, account, orders)
     strategy = MovingAverageCrossStrategy(params, watchlist)
-    ctx = AccountContext(account, orders)
+    if presets:
+        strategy.preset_info = presets.info        # 매수 신호에 지금 켜진 거래 옵션을 붙인다
+    if book:
+        strategy.exit_rule = book.get              # 보유 종목은 산 때 옵션 기준으로 매도
+        book.sync(orders.orders, account.snapshot)
+    ctx = AccountContext(account, orders, book)
+    guard.target_pct = lambda: strategy.p.daily_profit_target_pct   # 하루 목표 수익 (거래 옵션 값)
+    if book or presets:   # 청산 매도도 그 종목을 산 옵션으로 기록 (옵션별 성적)
+        def _sell_meta(sym: str) -> dict:
+            rule = book.get(sym) if book else None
+            pid, name = (rule.preset_id, rule.preset_name) if rule else (presets.info() if presets else ("", ""))
+            return {"preset_id": pid, "preset_name": name}
+        guard.sell_meta = _sell_meta
 
     def on_config(c: LiveConfig, changes: list[Change]) -> None:
         nonlocal params
@@ -315,6 +353,7 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
     ws_task = asyncio.create_task(ws.run(), name="kis-websocket")
     order_task = asyncio.create_task(orders.run(), name="order-sync")
     reporter = TickReporter()
+    book_snap = None
     session = clock.session()
     log.info("실시간 시세 수신 시작: %d종목, %s 까지", len(watchlist), fmt_kst(until))
     try:
@@ -323,6 +362,9 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 ws_task.result()   # 복구 불가 예외면 여기서 전파
                 break
             await watcher.check()
+            if book and account.snapshot is not book_snap:   # 잔고가 새로 조회되면 산 옵션 기록을 맞춘다
+                book_snap = account.snapshot
+                book.sync(orders.orders, book_snap)
             current = clock.session()
             if current != session:
                 log.info("세션 전환: %s → %s", session.label, current.label)
@@ -348,6 +390,8 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 orders.submit(signal)
     finally:
         unsubscribe()
+        if book:
+            book.sync(orders.orders, None)
         await watcher.close()
         await orders.close()
         order_task.cancel()
@@ -368,7 +412,8 @@ async def sleep_until(clock: MarketClock, target: datetime) -> None:
 
 async def run_forever(client: KisClient, account: AccountService, clock: MarketClock,
                       watchlist: list[WatchItem], cfg: LiveConfig, store: SettlementStore,
-                      risk_store: RiskStore, once: bool = False, dash: DashboardState | None = None) -> None:
+                      risk_store: RiskStore, once: bool = False, dash: DashboardState | None = None,
+                      presets: PresetStore | None = None, book: PositionBook | None = None) -> None:
     """세션 대기 → 거래일 매매 → 정산을 반복한다. once 면 거래일 하나를 마치고 반환."""
     while True:
         now = clock.now()
@@ -395,7 +440,8 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
         day_end = clock.trading_day_end(now)
         assert day_end is not None
         try:
-            await stream_quotes(client, account, clock, watchlist, cfg, store, risk_store, until=day_end, dash=dash)
+            await stream_quotes(client, account, clock, watchlist, cfg, store, risk_store, until=day_end, dash=dash,
+                                presets=presets, book=book)
         except Exception:
             log.exception("시세 수신 중 예기치 못한 오류 → 30초 후 재시작")
             await asyncio.sleep(30)
@@ -714,13 +760,18 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
         await log_deposit(account, client.settings.is_real)
         log.info("현재 시장 상태: %s", clock.session().label)
 
-        dash, dash_server = start_dashboard(settings, clock, cfg, risk_store, watchlist, store, account)
+        presets = PresetStore(BASE_DIR / "config" / "presets.toml", cfg)
+        book = PositionBook(BASE_DIR / "data" / "positions", settings.env)
+        log.info("거래 옵션: '%s' 켜짐 (%s), 전체 %d개", presets.active_name, presets.summary(presets.active_id),
+                 len(presets.presets))
+        dash, dash_server = start_dashboard(settings, clock, cfg, risk_store, watchlist, store, account, presets, book)
         try:
             if args.stream_test:
                 await stream_quotes(client, account, clock, watchlist, cfg, store, risk_store,
-                                    until=timedelta(seconds=args.stream_test), dash=dash)
+                                    until=timedelta(seconds=args.stream_test), dash=dash, presets=presets, book=book)
                 return 0
-            await run_forever(client, account, clock, watchlist, cfg, store, risk_store, once=args.once, dash=dash)
+            await run_forever(client, account, clock, watchlist, cfg, store, risk_store, once=args.once, dash=dash,
+                              presets=presets, book=book)
         finally:
             if dash_server:
                 await dash_server.stop()
@@ -729,7 +780,8 @@ async def run_job(args: argparse.Namespace, settings, clock: MarketClock, watchl
 
 
 def start_dashboard(settings, clock: MarketClock, cfg: LiveConfig, risk_store: RiskStore,
-                    watchlist: list[WatchItem], store: SettlementStore, account: AccountService) -> tuple[DashboardState | None, DashboardServer | None]:
+                    watchlist: list[WatchItem], store: SettlementStore, account: AccountService,
+                    presets: PresetStore | None = None, book: PositionBook | None = None) -> tuple[DashboardState | None, DashboardServer | None]:
     """[dashboard] enabled 면 웹 화면 서버를 매매와 같은 이벤트 루프에서 띄운다."""
     try:
         dparams = DashboardParams.from_toml(_STRATEGY_PATH)
@@ -741,6 +793,7 @@ def start_dashboard(settings, clock: MarketClock, cfg: LiveConfig, risk_store: R
     dash = DashboardState(settings.env, clock, cfg.ma, cfg.risk, {w.symbol for w in watchlist}, risk_store)
     dash.account = account
     dash.config = cfg
+    dash.presets, dash.book = presets, book
     cfg.subscribe(lambda c, _changes: dash.on_config(c))
     logging.getLogger().addHandler(dash.events)
     server = DashboardServer(dash, store, dparams, settings.dashboard_password)

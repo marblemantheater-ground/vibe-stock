@@ -53,7 +53,7 @@ class RunStore:
                 continue
             out.append({k: r.get(k) for k in ("id", "created_at", "period", "return_pct", "benchmark_return_pct",
                                                "max_drawdown_pct", "trades", "win_rate", "profit_factor", "fees",
-                                               "realized_pnl", "settings", "overrides")}
+                                               "realized_pnl", "settings", "overrides", "preset")}
                        | {"symbol_count": len(r.get("symbols") or [])})
         return out
 
@@ -73,7 +73,7 @@ def data_coverage(store: MinuteStore) -> dict:
 
 def run_backtest(cfg: LiveConfig, store: MinuteStore, runs: RunStore, *, start: date, end: date,
                  symbols: list[str] | None = None, overrides: dict | None = None, start_cash: float = 100_000,
-                 fill_slippage_pct: float = 0.05, progress=None) -> dict:
+                 fill_slippage_pct: float = 0.05, progress=None, preset: dict | None = None) -> dict:
     """현재 설정 + overrides(설정 화면과 같은 형식, 파일에는 쓰지 않음)로 백테스트하고 결과를 저장한다."""
     if start > end:
         raise ValueError("시작일이 종료일보다 늦습니다")
@@ -96,6 +96,7 @@ def run_backtest(cfg: LiveConfig, store: MinuteStore, runs: RunStore, *, start: 
     result["overrides"] = {k: v for k, v in (overrides or {}).items()
                            if k in by_id and _jsonable(getattr(cfg.params(by_id[k].section), by_id[k].key)) != v}
     result["created_at"] = datetime.now(KST).isoformat(timespec="seconds")
+    result["preset"] = preset   # 거래 옵션으로 실행했으면 {"id", "name"}
     runs.save(result)
     log.info("[백테스트] %s ~ %s, %d종목: 수익률 %+.2f%% (단순 보유 %+.2f%%), 최대 낙폭 %.2f%%, 거래 %d건, 승률 %s",
              start, end, len(chosen), result["return_pct"], result["benchmark_return_pct"], result["max_drawdown_pct"],

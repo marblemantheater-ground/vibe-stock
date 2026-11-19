@@ -35,6 +35,7 @@ class Signal:
     price: float       # 신호 발생 시점 가격 (주문 가격 결정은 4단계)
     reason: str
     created_at: datetime = field(default_factory=lambda: datetime.now(KST))
+    meta: dict | None = field(default=None, compare=False)   # 거래 옵션 정보 (산 때 매도 기준 등)
 
     def __str__(self) -> str:
         return f"{self.side.label} {self.symbol} {self.qty}주 @ ${self.price:,.2f} ({self.reason})"
@@ -46,6 +47,12 @@ class StrategyContext(Protocol):
     def position(self, symbol: str) -> Holding | None: ...
 
     def position_count(self) -> int: ...
+
+    def buys_today(self) -> int: ...
+
+    def last_sell_at(self, symbol: str) -> datetime | None: ...
+
+    def entry_time(self, symbol: str) -> datetime | None: ...
 
 
 class Strategy(ABC):

@@ -29,6 +29,7 @@ from dataclasses import dataclass, fields
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
 from broker.account import AccountService, AccountSnapshot
 from broker.order import OrderManager
@@ -50,17 +51,23 @@ _WARN_RATIO = 0.5             # 한도의 절반에 도달하면 미리 알림
 class HaltKind(str, Enum):
     PAUSE = "PAUSE"
     DAILY_LOSS = "DAILY_LOSS"
+    DAILY_TARGET = "DAILY_TARGET"
     MAX_DRAWDOWN = "MAX_DRAWDOWN"
     KILL = "KILL"
 
     @property
     def label(self) -> str:
-        return {"PAUSE": "일시정지", "DAILY_LOSS": "하루 손실 한도", "MAX_DRAWDOWN": "최대 낙폭 한도",
+        return {"PAUSE": "일시정지", "DAILY_LOSS": "하루 손실 한도", "DAILY_TARGET": "하루 목표 달성", "MAX_DRAWDOWN": "최대 낙폭 한도",
                 "KILL": "긴급 정지"}[self.value]
 
     @property
     def severity(self) -> int:
-        return {"PAUSE": 0, "DAILY_LOSS": 1, "MAX_DRAWDOWN": 2, "KILL": 3}[self.value]
+        return {"PAUSE": 0, "DAILY_LOSS": 1, "DAILY_TARGET": 1, "MAX_DRAWDOWN": 2, "KILL": 3}[self.value]
+
+    @property
+    def daily(self) -> bool:
+        """그날만 유효 (다음 거래일 자동 해제)."""
+        return self in (HaltKind.DAILY_LOSS, HaltKind.DAILY_TARGET)
 
 
 @dataclass(frozen=True)
@@ -93,7 +100,7 @@ class RiskParams:
         return p
 
     def action_for(self, kind: HaltKind) -> str:
-        if kind is HaltKind.KILL:
+        if kind in (HaltKind.KILL, HaltKind.DAILY_TARGET):   # 목표 달성: 전부 팔아 수익 확정
             return "liquidate"
         if kind is HaltKind.PAUSE:
             return "block_buys"
@@ -170,6 +177,8 @@ def apply_command_offline(store: RiskStore, command: str) -> str:
         state["peak_equity"] = None        # 다음 시작 때의 총자산을 새 고점으로
     elif kind is HaltKind.DAILY_LOSS:
         state["day_start_equity"] = None   # 다음 시작 때의 총자산을 오늘 기준점으로
+    elif kind is HaltKind.DAILY_TARGET:
+        state["target_done_day"] = state.get("day")   # 오늘은 목표로 다시 멈추지 않음
     store.save(state)
     return "일시정지를 해제했습니다" if kind is HaltKind.PAUSE else f"{kind.label} 중지를 해제했습니다"
 
@@ -210,6 +219,8 @@ class RiskGuard:
         self._last_liq_order: dict[str, float] = {}
         self._liq_done_logged = False
         orders.buy_gate = self.buy_block_reason
+        self.target_pct: Callable[[], float] = lambda: 0.0   # 하루 목표 수익 % (거래 옵션 값, 0 = 끔)
+        self.sell_meta: Callable[[str], dict | None] = lambda _sym: None   # 청산 매도에 붙일 거래 옵션 정보
 
     def set_params(self, params: RiskParams, order_timeout_sec: float) -> None:
         """설정 화면·파일에서 바뀐 한도를 바로 반영 (이미 발동한 중지는 그대로 유지)."""
@@ -241,16 +252,20 @@ class RiskGuard:
         """청산 모드에서 보유 종목과 미체결 주문이 모두 없어졌는지."""
         return self._liq_done_logged
 
-    async def start(self, start_equity: float | None) -> None:
-        """거래일 시작: 기준점(오늘 시작 총자산·고점)을 정하고 남아 있는 중지 상태를 이어받는다."""
+    async def start(self, start_equity: float | None, start_cash: float | None = None) -> None:
+        """거래일 시작: 기준점(오늘 시작 총자산·예수금·고점)을 정하고 남아 있는 중지 상태를 이어받는다."""
         s = self.state
         if s.get("day") != self._today:
-            s["day"], s["day_start_equity"] = self._today, start_equity
-            if self.halt_kind is HaltKind.DAILY_LOSS:
-                log.info("[손실 차단] 새 거래일 → 하루 손실 한도 중지 자동 해제", extra=NOTIFY)
+            s["day"], s["day_start_equity"], s["day_start_cash"] = self._today, start_equity, start_cash
+            s["target_done_day"] = None
+            if self.halt_kind and self.halt_kind.daily:
+                log.info("[손실 차단] 새 거래일 → %s 중지 자동 해제", self.halt_kind.label, extra=NOTIFY)
                 s["halt"] = None
-        elif not s.get("day_start_equity"):
-            s["day_start_equity"] = start_equity   # 같은 날 재시작이면 처음 기준점 유지
+        else:   # 같은 날 재시작이면 처음 기준점 유지
+            if not s.get("day_start_equity"):
+                s["day_start_equity"] = start_equity
+            if not s.get("day_start_cash"):
+                s["day_start_cash"] = start_cash
         if start_equity and (not s.get("peak_equity") or start_equity > s["peak_equity"]):
             s["peak_equity"], s["peak_date"] = start_equity, self._today
         self._save()
@@ -324,6 +339,7 @@ class RiskGuard:
             checks.append((HaltKind.MAX_DRAWDOWN, dd, self.p.max_drawdown_pct,
                            f"고점 ${peak:,.2f} → 현재 ${eq:,.2f} ({-dd:+.2f}%)"))
 
+        await self._check_target(eq, now)
         for kind, value, limit, text in checks:
             if value < limit:
                 self._breach_since.pop(kind, None)
@@ -338,6 +354,31 @@ class RiskGuard:
             if now - since >= self.p.confirm_sec:
                 await self.trigger(kind, f"{text}, 한도 {limit:g}%")
 
+    def target_progress(self, eq: float | None = None) -> dict | None:
+        """하루 목표: 오늘 손익(총자산 변화 = 실현 + 평가) ÷ (하루 시작 예수금 × 목표 %)."""
+        pct = self.target_pct()
+        cash, start = self.state.get("day_start_cash"), self.state.get("day_start_equity")
+        eq = self.equity() if eq is None else eq
+        if not pct or not cash or not start or eq is None:
+            return None
+        goal = cash * pct / 100
+        return {"pct": pct, "start_cash": cash, "goal": goal, "gain": eq - start, "ratio": (eq - start) / goal}
+
+    async def _check_target(self, eq: float, now: float) -> None:
+        prog = self.target_progress(eq)
+        if prog is None or self.state.get("target_done_day") == self._today:
+            return
+        if prog["gain"] < prog["goal"]:
+            self._breach_since.pop(HaltKind.DAILY_TARGET, None)
+            return
+        if self.halt and self.halt_kind.severity >= HaltKind.DAILY_TARGET.severity:
+            return
+        since = self._breach_since.setdefault(HaltKind.DAILY_TARGET, now)
+        if now - since >= self.p.confirm_sec:
+            await self.trigger(HaltKind.DAILY_TARGET,
+                               f"오늘 손익 ${prog['gain']:+,.2f} ≥ 목표 ${prog['goal']:,.2f} "
+                               f"(시작 예수금 ${prog['start_cash']:,.2f}의 {prog['pct']:g}%)")
+
     # ── 발동 · 해제 ─────────────────────────────────────────
     async def trigger(self, kind: HaltKind, reason: str) -> bool:
         """매매 중지 발동. 이미 같거나 더 높은 단계로 중지 중이면 아무것도 하지 않고 False."""
@@ -350,9 +391,9 @@ class RiskGuard:
         self._breach_since.clear()
         self._liq_done_logged = False
         action = self.p.action_for(kind)
-        until = "오늘 장 마감까지" if kind is HaltKind.DAILY_LOSS else "재개(--resume)할 때까지"
+        until = "오늘 장 마감까지 (다음 거래일 자동 재개)" if kind.daily else "재개(--resume)할 때까지"
         what = "미체결 전부 취소 + 보유 전부 매도 + 신규 매수 중지" if action == "liquidate" else "신규 매수 중지 (매도는 계속)"
-        level = logging.WARNING if kind is HaltKind.PAUSE else logging.ERROR
+        level = logging.WARNING if kind in (HaltKind.PAUSE, HaltKind.DAILY_TARGET) else logging.ERROR
         log.log(level, "[%s 발동] %s → %s, %s", kind.label, reason, what, until, extra=NOTIFY)
 
         if action == "liquidate":
@@ -375,6 +416,8 @@ class RiskGuard:
             self.state["peak_equity"], self.state["peak_date"] = eq, self._today
         elif kind is HaltKind.DAILY_LOSS:
             self.state["day_start_equity"] = eq
+        elif kind is HaltKind.DAILY_TARGET:
+            self.state["target_done_day"] = self._today   # 사용자가 재개 → 오늘은 목표로 다시 멈추지 않음
         self._save()
         self._breach_since.clear()
         self._warned.clear()
@@ -419,6 +462,6 @@ class RiskGuard:
             if qty < 1 or price <= 0:
                 continue
             self._last_liq_order[sym] = now
-            signal = Signal(sym, h.exchange, Side.SELL, qty, price, f"{self.halt_kind.label} 청산")
+            signal = Signal(sym, h.exchange, Side.SELL, qty, price, f"{self.halt_kind.label} 청산", meta=self.sell_meta(sym))
             log.warning("[청산 매도] %s", signal)
             self._orders.submit(signal, force=True, slippage_pct=self.p.liquidation_slippage_pct)

@@ -355,3 +355,61 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
   .bt-form { position: static; max-height: none; }
   .bt-scroll { max-height: 420px; }
 }
+
+/* ── 거래 옵션 ── */
+.presets { display: flex; flex-direction: column; gap: 16px; }
+.preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: stretch; }
+.preset-card { border-width: 1px; }
+.preset-card.on { border-color: var(--good); box-shadow: inset 0 3px 0 var(--good); }
+.preset-head { display: flex; align-items: flex-start; gap: 10px; padding: 14px 16px 10px; }
+.preset-title { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.preset-title h3 { margin: 0; font-size: 15px; }
+.radio { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--idle); margin-top: 2px; flex: none; }
+.radio.on { border-color: var(--good); background: radial-gradient(circle, var(--good) 45%, transparent 50%); }
+.preset-values { display: grid; grid-template-columns: 1fr 1fr; gap: 0; margin: 0; padding: 0 16px 8px; font-size: 13px; }
+.preset-values div { display: flex; justify-content: space-between; gap: 8px; padding: 4px 6px; border-bottom: 1px dashed var(--line); }
+.preset-values dt { color: var(--muted); }
+.preset-values dd { margin: 0; text-align: right; }
+.preset-values div.diff { background: var(--info-bg); border-radius: 4px; }
+.preset-values div.diff dd { font-weight: 700; }
+.preset-stats { display: flex; flex-direction: column; gap: 4px; padding: 8px 16px; border-top: 1px solid var(--line); }
+.preset-stats > div { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; }
+.preset-stats .muted.small:first-child { min-width: 72px; }
+.preset-actions { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px 14px; margin-top: auto; }
+.preset-new { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; min-height: 180px;
+  border: 2px dashed var(--line); background: transparent; color: var(--ink); cursor: pointer; font: inherit; font-weight: 600; }
+.preset-new:hover { border-color: var(--accent); color: var(--accent); }
+.preset-new .plus { font-size: 28px; line-height: 1; }
+.preset-form { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; }
+.preset-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.preset-form input { font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--ink); }
+.preset-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.preset-fields { max-height: 46vh; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+.preset-fields .field { padding: 8px 12px; }
+.preset-fields .field-help { display: none; }
+.dialog:has(.preset-fields) { width: min(620px, 100%); }
+.preset-tag { display: inline-block; margin-top: 2px; font-size: 11px; color: var(--muted); background: var(--idle-bg); border-radius: 3px; padding: 0 5px; }
+.chip-link { text-decoration: none; }
+.chip-link:hover { color: var(--ink); }
+@media (max-width: 560px) {
+  .preset-grid { grid-template-columns: minmax(0, 1fr); }
+  .preset-form { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ── 하루 목표 ── */
+.level-target { background: var(--good); }
+.limits-line { margin-top: 4px; }
+.halt-banner.good { background: var(--good-bg); border-bottom-color: var(--good); }
+.halt-banner.good strong { color: var(--good); }
+
+/* ── 스캘핑 ── */
+.scalp { display: flex; flex-direction: column; gap: 16px; }
+.scalp .settings-intro .notice-list { margin: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips .chip { font-weight: 500; }
+.tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.tpl { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.tpl .btn { align-self: flex-start; margin-top: 4px; }
+td.actions { display: flex; gap: 6px; justify-content: flex-end; }
+.scalp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 4px; }
+.scalp-head h2 { margin: 0; font-size: 16px; }

@@ -49,11 +49,24 @@ function Kpi({ label, value, sub, tone: t = "flat" }: { label: string; value: st
 }
 
 function RiskGauges({ risk }: { risk: Risk }) {
+  const t = risk.target;
+  const l = risk.limits;
+  const ratio = t ? Math.min(Math.max(t.ratio, 0), 1) : 0;
   return (
     <div className="kpi">
-      <div className="kpi-label">손실 한도</div>
+      <div className="kpi-label">손실 한도 · 하루 목표</div>
       <Gauge label="하루 손실" used={risk.daily_loss_pct} limit={risk.daily_limit_pct} />
       <Gauge label="고점 대비" used={risk.drawdown_pct} limit={risk.max_drawdown_pct} />
+      {l.target_pct > 0 && (
+        <div className="gauge" title={t ? `오늘 손익 ${usd(t.gain, { sign: true })} / 목표 ${usd(t.goal)} (시작 예수금 ${usd(t.start_cash)}의 ${t.pct}%)` : "거래일이 시작되면 계산"}>
+          <span>하루 목표</span>
+          <div className="bar"><div className="fill level-target" style={{ width: `${ratio * 100}%` }} /></div>
+          <span className="num small">{t ? `${Math.round(Math.max(t.ratio, 0) * 100)}%` : "–"}{t?.done_today ? " 완료" : ""}</span>
+        </div>
+      )}
+      <div className="kpi-sub limits-line">
+        매수 {l.buys_today}{l.max_buys ? `/${l.max_buys}회` : "회"} · 보유 {l.positions}/{l.max_positions}종목
+      </div>
     </div>
   );
 }
@@ -101,7 +114,8 @@ function Positions({ rows }: { rows: Position[] }) {
         <tbody>
           {rows.map((p) => (
             <tr key={p.symbol}>
-              <td><Sym symbol={p.symbol} sub={p.name || p.exchange} /></td>
+              <td><Sym symbol={p.symbol} sub={p.name || p.exchange} />
+                <span className="preset-tag" title={p.preset_recorded ? "산 때 옵션 기준으로 매도" : "산 옵션 기록 없음 → 지금 켜진 옵션 기준"}>{p.preset}{p.preset_recorded ? "" : " (현재)"}</span></td>
               <td className="r num">{num(p.qty, 4)}</td>
               <td className="r num">{usd(p.avg_price)}</td>
               <td className="r num">

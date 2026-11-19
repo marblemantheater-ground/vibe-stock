@@ -74,6 +74,7 @@ class Order:
     adopted: bool = False     # 시작 시 계좌에서 불러온 기존 미체결 주문 (이전 실행 또는 HTS 직접 주문)
     created_at: float = field(default_factory=time.monotonic)
     placed_at: datetime = field(default_factory=lambda: datetime.now(KST))
+    filled_at: datetime | None = None   # 마지막으로 체결 수량이 늘어난 시각 (재매수 대기 계산용)
 
     @property
     def symbol(self) -> str:
@@ -176,6 +177,17 @@ class OrderManager:
     def pending_buy_symbols(self) -> set[str]:
         return {o.symbol for o in self.open_orders() if o.side is Side.BUY}
 
+    def last_sell_at(self, symbol: str) -> datetime | None:
+        """오늘 이 종목 매도가 마지막으로 체결된 시각 (프로그램·청산·HTS 매도 모두)."""
+        times = [o.filled_at or o.placed_at for o in self.orders
+                 if o.symbol == symbol and o.side is Side.SELL and o.filled_qty > 0]
+        return max(times) if times else None
+
+    def last_buy_at(self, symbol: str) -> datetime | None:
+        times = [o.filled_at or o.placed_at for o in self.orders
+                 if o.symbol == symbol and o.side is Side.BUY and o.filled_qty > 0]
+        return max(times) if times else None
+
     def buys_today(self, symbol: str) -> int:
         """오늘 이 프로그램이 낸 매수 중 체결됐거나(일부 포함) 진행 중인 건수 (키움 강의의 당일 매수 장부).
         체결 없이 취소·거부된 주문은 세지 않으므로 다시 매수할 수 있다."""
@@ -238,7 +250,8 @@ class OrderManager:
         if self.open_orders(signal.symbol):
             return "같은 종목에 미체결 주문이 있음"
         sent_today = sum(1 for o in self.orders if o.status is not OrderStatus.REJECTED and not o.adopted)
-        if not force and sent_today >= self.p.max_orders_per_day:
+        # 매도(익절·손절·청산)는 한도와 무관하게 낸다 → 한도에 닿아도 보유 종목을 지킬 수 있게
+        if not force and signal.side is Side.BUY and sent_today >= self.p.max_orders_per_day:
             return f"일일 주문 한도({self.p.max_orders_per_day}건) 도달"
         snap = self._account.snapshot
         if snap is None:
@@ -482,6 +495,8 @@ class OrderManager:
         order.filled_qty = filled
         if filled:
             order.avg_fill_price = _num(row.get("ft_ccld_unpr3"))
+        if filled > prev_filled:
+            order.filled_at = datetime.now(KST)
 
         if filled >= order.qty:
             order.status = OrderStatus.FILLED

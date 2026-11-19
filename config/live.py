@@ -54,7 +54,7 @@ class Field:
 _ACTION_OPTS = (("block_buys", "신규 매수만 중지"), ("liquidate", "전부 청산"))
 _SESSION_OPTS = tuple((s.value, s.label) for s in (Session.PRE, Session.REGULAR, Session.AFTER))
 
-GROUPS = ("매수 신호", "익절·손절", "자금 배분", "주문", "손실 차단", "수수료·세금", "안전 스위치")
+GROUPS = ("매수 신호", "스캘핑", "익절·손절", "자금 배분", "하루 목표·한도", "주문", "손실 차단", "수수료·세금", "안전 스위치")
 
 FIELDS: tuple[Field, ...] = (
     # ── 매수 신호 ──
@@ -65,11 +65,38 @@ FIELDS: tuple[Field, ...] = (
     Field("ma_cross", "max_change_rate", "등락률 상한", "number", "매수 신호", unit="%", min=-30, max=30, step=0.1),
     Field("ma_cross", "cooldown_sec", "신호 간격", "int", "매수 신호", unit="초", min=0, max=3600, step=10,
           help="한 종목에서 신호가 난 뒤 이 시간 동안 같은 종목 신호를 무시합니다"),
+    Field("ma_cross", "rebuy_wait_sec", "매도 후 재매수 대기", "int", "매수 신호", unit="초", min=0, max=86_400, step=10,
+          help="같은 종목을 판(체결) 뒤 이 시간 동안은 다시 사지 않음 (0 = 바로 가능). 매도는 막지 않음. "
+               "같은 날 다시 사려면 주문 > '종목당 하루 매수 횟수'도 2 이상이어야 함"),
     Field("ma_cross", "bar_minutes", "봉 단위", "select", "매수 신호", apply="next_day",
           options=tuple((m, f"{m}분") for m in (1, 2, 3, 5, 10, 15, 30, 60))),
     Field("ma_cross", "short_window", "단기 이동평균", "int", "매수 신호", apply="next_day", unit="봉", min=1, max=118, step=1),
     Field("ma_cross", "long_window", "장기 이동평균", "int", "매수 신호", apply="next_day", unit="봉", min=2, max=119, step=1,
           help="단기보다 커야 합니다. 과거 분봉 조회 한도 때문에 119봉까지"),
+    # ── 스캘핑 (진입 방식 · 짧은 청산 · 실시간 거르개) ──
+    Field("ma_cross", "entry_mode", "진입 방식", "select", "스캘핑",
+          options=(("ma_cross", "이평 교차 (기존)"), ("breakout", "박스 돌파"), ("vwap", "VWAP 눌림 반등"),
+                   ("orb", "시가 범위 돌파")),
+          help="이평 교차: 단기 이평이 장기 이평 상향 돌파 / 박스 돌파: 직전 N봉 고가 돌파 / "
+               "VWAP 눌림: 상승 추세에서 VWAP 까지 눌렸다가 양봉 반등 / 시가 범위: 정규장 첫 N분 고가 돌파"),
+    Field("ma_cross", "breakout_bars", "박스 돌파 기준 봉 수", "int", "스캘핑", unit="봉", min=2, max=118, step=1,
+          help="박스 돌파에서 직전 몇 개 봉의 최고가를 넘으면 살지"),
+    Field("ma_cross", "orb_minutes", "시가 범위 시간", "int", "스캘핑", unit="분", min=1, max=120, step=1,
+          help="시가 범위 돌파에서 정규장 시작 후 몇 분을 범위로 볼지"),
+    Field("ma_cross", "volume_mult", "돌파 거래량 배수", "number", "스캘핑", unit="배", min=0, max=50, step=0.1,
+          help="돌파 봉 거래량이 기준 봉 평균의 이 배 이상일 때만 매수 (0 = 끔). 거래량 없는 돌파는 실패가 많음"),
+    Field("ma_cross", "trailing_activate_pct", "추적 손절 시작", "number", "스캘핑", unit="%", min=0, max=50, step=0.1,
+          help="고점이 매입가 대비 이만큼 오르면 추적 손절을 켬 (0 = 끔)"),
+    Field("ma_cross", "trailing_pct", "추적 손절 폭", "number", "스캘핑", unit="%", min=0.05, max=20, step=0.05,
+          help="추적 손절이 켜진 뒤 고점 대비 이만큼 밀리면 매도"),
+    Field("ma_cross", "max_hold_min", "최대 보유 시간", "int", "스캘핑", unit="분", min=0, max=1440, step=1,
+          help="산 뒤 이 시간이 지나면 손익과 상관없이 매도 (0 = 끔). 움직이지 않는 종목에 돈이 묶이지 않게"),
+    Field("ma_cross", "flatten_before_close_min", "마감 전 정리", "int", "스캘핑", unit="분", min=0, max=240, step=1,
+          help="고른 세션 중 마지막 세션이 끝나기 이 시간 전에 보유 전부 매도, 그 뒤로는 매수 안 함 (0 = 끔)"),
+    Field("ma_cross", "min_strength", "체결강도 하한 (실시간)", "number", "스캘핑", min=0, max=1000, step=5,
+          help="체결강도가 이 값 이상일 때만 매수 (0 = 끔, 100 = 매수·매도 균형). 분봉에 없어 백테스트에는 적용 안 됨"),
+    Field("ma_cross", "max_spread_pct", "호가 스프레드 상한 (실시간)", "number", "스캘핑", unit="%", min=0, max=5, step=0.01,
+          help="최우선 매수·매도 호가 차이가 이 % 이하일 때만 매수 (0 = 끔). 백테스트에는 적용 안 됨"),
     # ── 익절·손절 ──
     Field("ma_cross", "take_profit_pct", "익절", "number", "익절·손절", unit="%", min=0.1, max=100, step=0.1,
           help="매입평균가 대비 이만큼 오르면 전량 매도"),
@@ -80,7 +107,15 @@ FIELDS: tuple[Field, ...] = (
           help="종목당 예산 = 거래일 시작 시 주문가능 USD × 비율 ÷ 최대 보유 종목 수. 0 이면 아래 고정 금액 사용"),
     Field("ma_cross", "budget_per_trade_usd", "1회 매수 고정 금액", "number", "자금 배분", unit="USD", min=1, max=10_000_000, step=100,
           help="사용 비율이 0 일 때만 씁니다"),
-    Field("ma_cross", "max_positions", "최대 보유 종목 수", "int", "자금 배분", unit="종목", min=1, max=50, step=1),
+    # ── 하루 목표·한도 (거래 옵션마다 다르게) ──
+    Field("ma_cross", "daily_profit_target_pct", "하루 목표 수익", "number", "하루 목표·한도", unit="%", min=0, max=100, step=0.5,
+          help="오늘 손익(실현+보유 평가)이 하루 시작 예수금의 이 비율 이상이면 보유 전부 매도하고 그날 매매 종료. "
+               "다음 거래일 자동 재개 (0 = 끔)"),
+    Field("ma_cross", "max_buys_per_day", "하루 최대 매수 횟수", "int", "하루 목표·한도", unit="회", min=0, max=1000, step=1,
+          help="오늘 매수가 이 횟수에 닿으면 더 사지 않음 (0 = 제한 없음). 매도는 막지 않음. 1회 금액은 자금 배분 설정"),
+    Field("ma_cross", "max_positions", "최대 보유 종목 수", "int", "하루 목표·한도", unit="종목", min=1, max=50, step=1,
+          help="보유(+매수 대기) 종목이 이 수에 닿으면 새 종목을 사지 않음. 하나가 팔리면 다시 매수. "
+               "사용 비율로 예산을 정할 때 나누는 수이기도 함"),
     # ── 주문 ──
     Field("order", "slippage_pct", "지정가 여유", "number", "주문", unit="%", min=0, max=4.9, step=0.05,
           help="매수는 현재가보다 이만큼 높게, 매도는 낮게 지정가를 냅니다 (사실상 즉시 체결)"),
@@ -88,7 +123,7 @@ FIELDS: tuple[Field, ...] = (
           help="이 시간 안에 체결되지 않으면 남은 수량을 취소합니다"),
     Field("order", "poll_interval_sec", "체결 확인 주기", "int", "주문", unit="초", min=1, max=60, step=1),
     Field("order", "max_orders_per_day", "하루 최대 주문", "int", "주문", unit="건", min=1, max=1000, step=1,
-          help="거부된 주문은 세지 않습니다. 청산 주문은 한도와 무관하게 나갑니다"),
+          help="모든 옵션 공통 안전 한도 (매수·매도 합계, 거부 제외). 한도에 닿으면 매수만 막고 매도는 계속"),
     Field("order", "max_buys_per_symbol", "종목당 하루 매수 횟수", "int", "주문", unit="회", min=0, max=100, step=1,
           help="0 = 제한 없음. 1 이면 손절한 종목을 같은 날 다시 사지 않습니다"),
     Field("order", "cancel_buy_above_limit", "가격 이탈 시 매수 취소", "bool", "주문",

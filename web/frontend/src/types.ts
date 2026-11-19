@@ -36,6 +36,8 @@ export type Risk = {
   daily_loss_pct: number | null;
   drawdown_pct: number | null;
   peak_equity: number | null;
+  target: { pct: number; goal: number; gain: number; ratio: number; start_cash: number; done_today: boolean } | null;
+  limits: { buys_today: number; max_buys: number; positions: number; max_positions: number; target_pct: number };
 };
 
 export type Position = {
@@ -55,6 +57,8 @@ export type Position = {
   to_tp_pct: number;
   to_sl_pct: number;
   live: boolean;
+  preset: string;
+  preset_recorded: boolean;
 };
 
 export type Order = {
@@ -102,6 +106,7 @@ export type StrategyInfo = {
   budget_per_trade_usd: number;
   max_positions: number;
   sessions: string[];
+  preset: string | null;
 };
 
 export type Snapshot = {
@@ -187,6 +192,7 @@ export type SettingsView = {
   editable: boolean;
   env?: "paper" | "real";
   trading?: boolean;
+  preset?: string | null;
   file: string | null;
   groups: { title: string; fields: SettingField[] }[];
 };

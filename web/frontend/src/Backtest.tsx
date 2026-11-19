@@ -5,7 +5,7 @@ import { Dialog } from "./Controls";
 import { pct, tone, usd } from "./format";
 import { useWidth } from "./Reports";
 
-const GROUPS = ["매수 신호", "익절·손절", "자금 배분", "주문", "손실 차단"];
+const GROUPS = ["매수 신호", "스캘핑", "익절·손절", "자금 배분", "하루 목표·한도", "주문", "손실 차단"];
 const FEW_TRADES = 30;
 
 // 백테스트: 저장된 1분봉으로 실제 전략 코드를 돌려 본다. 바꿔 본 값은 파일에 쓰지 않는다 (적용 버튼을 눌러야 설정에 반영)

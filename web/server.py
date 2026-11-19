@@ -31,7 +31,8 @@ from backtest.runs import RunStore, data_coverage, run_backtest
 from config.settings import BASE_DIR
 from market.minute import MinuteStore
 from report.annual import FeeParams, TaxParams, available_years, compute_annual, sells_csv
-from report.settlement import SettlementStore
+from report.settlement import SettlementStore, preset_performance
+from web.scalp import scalp_view, template_values
 from web.state import DashboardState
 
 log = logging.getLogger(__name__)
@@ -207,14 +208,23 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
             if not isinstance(overrides, dict) or (symbols is not None and not isinstance(symbols, list)):
                 raise ValueError
             cash, slip = float(body.get("start_cash", 100_000)), float(body.get("fill_slippage_pct", 0.05))
+            preset_id = body.get("preset")
         except (ValueError, KeyError, TypeError):
             raise HTTPException(400, "요청 형식 오류") from None
+        preset = None
+        if preset_id:   # 거래 옵션으로 실행: 그 옵션의 전략 값으로 덮어쓴다
+            if not state.presets or preset_id not in state.presets.presets:
+                raise HTTPException(400, "없는 거래 옵션입니다")
+            p = state.presets.presets[preset_id]
+            overrides = {**overrides, **{f"ma_cross.{k}": v for k, v in state.presets._values(preset_id).items()}}
+            preset = {"id": preset_id, "name": p["name"]}
         bt.update(running=True, progress=0.0, started_at=datetime.now().isoformat(timespec="seconds"), error=None)
         log.info("[대시보드] 백테스트 요청: %s ~ %s, 바꾼 값 %d개", start, end, len(overrides))
         try:
             result = await asyncio.to_thread(
                 run_backtest, state.config, minutes, runs, start=start, end=end, symbols=symbols, overrides=overrides,
-                start_cash=cash, fill_slippage_pct=slip, progress=lambda x: bt.__setitem__("progress", round(x, 3)))
+                start_cash=cash, fill_slippage_pct=slip, progress=lambda x: bt.__setitem__("progress", round(x, 3)),
+                preset=preset)
         except ValueError as e:
             bt["error"] = str(e)
             raise HTTPException(400, str(e)) from None
@@ -239,6 +249,117 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         if r is None:
             raise HTTPException(404, "기록이 없습니다")
         return r
+
+    # ── 거래 옵션 ───────────────────────────────────────────
+    def presets_or_400():
+        if state.presets is None:
+            raise HTTPException(400, "거래 옵션을 쓸 수 없습니다")
+        return state.presets
+
+    def presets_view() -> dict:
+        ps = presets_or_400()
+        perf = preset_performance(store)
+        last_bt: dict[str, dict] = {}
+        for r in runs.list(100):
+            pid = (r.get("preset") or {}).get("id")
+            if pid and pid not in last_bt:
+                last_bt[pid] = r
+        items = []
+        for p in ps.list():
+            items.append({**p, "summary": ps.summary(p["id"]), "live": perf.get(p["name"]), "backtest": last_bt.get(p["id"])})
+        fields = [f for g in (state.config.describe()["groups"] if state.config else []) for f in g["fields"]
+                  if f["section"] == "ma_cross"]
+        snap = state.account.snapshot if state.account else None
+        holdings = []
+        for sym, h in sorted((snap.holdings if snap else {}).items()):
+            rule = state.book.get(sym) if state.book else None
+            holdings.append({"symbol": sym, "qty": h.quantity, "preset": rule.preset_name if rule else None,
+                             "rule": rule.summary() if rule else None})
+        return {"active": ps.active_id, "presets": items, "fields": fields, "holdings": holdings,
+                "trading": state.phase == "trading", "env": state.env}
+
+    async def preset_body(request: Request) -> dict:
+        try:
+            body = await request.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise HTTPException(400, "요청 형식 오류")
+        return body
+
+    @app.get("/api/presets")
+    async def get_presets(request: Request):
+        authed(request)
+        return await asyncio.to_thread(presets_view)
+
+    @app.post("/api/presets")
+    async def create_preset(request: Request):
+        guarded(request)
+        body = await preset_body(request)
+        try:
+            pid = presets_or_400().create(body.get("name", ""), body.get("description", ""), body.get("values"),
+                                          body.get("copy_from"))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        return {"ok": True, "id": pid, "message": f"'{state.presets.presets[pid]['name']}' 을(를) 만들었습니다", **presets_view()}
+
+    @app.put("/api/presets/{pid}")
+    async def update_preset(pid: str, request: Request):
+        guarded(request)
+        body = await preset_body(request)
+        try:
+            changes = presets_or_400().update(pid, body.get("name"), body.get("description"), body.get("values"))
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        active = pid == state.presets.active_id
+        msg = "저장했습니다" + (f". 켜져 있는 옵션이라 바뀐 값 {len(changes)}개를 매매에 적용했습니다" if active and changes else "")
+        return {"ok": True, "message": msg, **presets_view()}
+
+    @app.delete("/api/presets/{pid}")
+    async def delete_preset(pid: str, request: Request):
+        guarded(request)
+        try:
+            name = presets_or_400().presets.get(pid, {}).get("name", pid)
+            state.presets.delete(pid)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        return {"ok": True, "message": f"'{name}' 을(를) 지웠습니다", **presets_view()}
+
+    @app.post("/api/presets/{pid}/activate")
+    async def activate_preset(pid: str, request: Request):
+        guarded(request)
+        try:
+            changes = presets_or_400().activate(pid)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        later = [c for c in changes if c.field.apply != "now"]
+        msg = f"'{state.presets.active_name}' 을(를) 켰습니다. 새 매수부터 적용되고, 보유 종목은 산 때 옵션 기준으로 매도합니다"
+        if later and state.phase == "trading":
+            msg += f". {', '.join(c.field.label for c in later)}은(는) 다음 거래일부터"
+        return {"ok": True, "message": msg, **presets_view()}
+
+    # ── 스캘핑 ───────────────────────────────────────────────
+    @app.get("/api/scalp")
+    async def get_scalp(request: Request):
+        authed(request)
+        items = (await asyncio.to_thread(presets_view))["presets"] if state.presets else []
+        return scalp_view(state, items)
+
+    @app.post("/api/scalp/templates/{key}")
+    async def scalp_from_template(key: str, request: Request):
+        """템플릿으로 거래 옵션 만들기 (켜지는 않는다 → 백테스트 후 거래 옵션 탭이나 여기서 켜기)."""
+        guarded(request)
+        try:
+            name, desc, values = template_values(key)
+            ps = presets_or_400()
+            names = {p["name"] for p in ps.presets.values()}
+            final, n = name, 2
+            while final in names:
+                final, n = f"{name} {n}", n + 1
+            pid = ps.create(final, desc, values)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from None
+        return {"ok": True, "id": pid, "message": f"'{final}' 거래 옵션을 만들었습니다. 백테스트로 먼저 확인해 보세요"}
 
     @app.get("/api/reports")
     async def reports(request: Request):

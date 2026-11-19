@@ -46,6 +46,8 @@ export default function Controls({ snap }: { snap: Snapshot }) {
       ? { tone: "warn", text: "일시정지", sub: "신규 매수만 멈춤 · 익절·손절 매도는 계속" }
       : halt.kind === "KILL"
         ? { tone: "bad", text: "긴급 정지", sub: "보유 종목 청산 · 신규 매수 중지" }
+      : halt.kind === "DAILY_TARGET"
+        ? { tone: "good", text: "하루 목표 달성", sub: "보유 종목 매도 · 오늘 매매 종료 · 다음 거래일 자동 재개" }
         : { tone: "bad", text: `${halt.label} 중지`, sub: "신규 매수 중지 · 매도는 계속" };
 
   // 손실 한도·긴급 정지 해제는 기준점이 바뀌거나 청산이 멈추므로 확인을 거친다
@@ -101,6 +103,7 @@ export default function Controls({ snap }: { snap: Snapshot }) {
 
 function resumeText(kind: string): string {
   if (kind === "DAILY_LOSS") return "신규 매수를 다시 시작합니다. 현재 총자산이 오늘의 새 기준점이 되어, 지금부터 한도만큼 더 잃으면 다시 멈춥니다.";
+  if (kind === "DAILY_TARGET") return "오늘 매수를 다시 시작합니다. 오늘은 목표 달성으로 다시 멈추지 않습니다 (손실 한도는 그대로 동작).";
   if (kind === "MAX_DRAWDOWN") return "신규 매수를 다시 시작합니다. 현재 총자산이 새 고점이 되어, 지금부터 한도만큼 빠지면 다시 멈춥니다.";
   return "청산을 멈추고 신규 매수를 다시 시작합니다. 아직 팔리지 않은 종목은 다시 전략의 익절·손절 기준을 따릅니다.";
 }

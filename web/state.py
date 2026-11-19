@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     from broker.account import AccountService
     from broker.order import OrderManager
     from config.live import LiveConfig
+    from config.presets import PresetStore
+    from strategy.positions import PositionBook
     from core.ws_client import KisWebSocket, Tick
     from risk.guard import RiskGuard, RiskParams
     from strategy.ma_cross import MaCrossParams, MovingAverageCrossStrategy
@@ -69,6 +71,8 @@ class DashboardState:
         self.manual_symbols = manual_symbols
         self.risk_store = risk_store
         self.config: LiveConfig | None = None   # 설정 화면 (없으면 읽기 전용)
+        self.presets: PresetStore | None = None  # 거래 옵션
+        self.book: PositionBook | None = None    # 보유 종목별 산 때 옵션 기준
         self.started_at = datetime.now(KST)
         self.events = EventLog()
         self.phase = "starting"            # starting / waiting / trading
@@ -121,7 +125,8 @@ class DashboardState:
         if self.config is None:
             return {"editable": False, "groups": [], "file": None}
         self.config.poll(force=True)
-        return {"editable": True, "env": self.env, "trading": self.phase == "trading", **self.config.describe()}
+        return {"editable": True, "env": self.env, "trading": self.phase == "trading",
+                "preset": self.presets.active_name if self.presets else None, **self.config.describe()}
 
     def update_settings(self, values: dict) -> dict:
         if self.config is None:
@@ -231,7 +236,8 @@ class DashboardState:
         p = self.risk_params
         out = {"daily_limit_pct": p.daily_loss_limit_pct, "max_drawdown_pct": p.max_drawdown_pct,
                "daily_action": p.daily_loss_action, "drawdown_action": p.max_drawdown_action,
-               "halt": None, "daily_loss_pct": None, "drawdown_pct": None, "peak_equity": None}
+               "halt": None, "daily_loss_pct": None, "drawdown_pct": None, "peak_equity": None,
+               "target": None, "limits": self._limits()}
         state = self.guard.state if self.guard else (self.risk_store.load() if self.risk_store else {})
         if (halt := state.get("halt")):
             out["halt"] = {"kind": halt["kind"], "label": HaltKind(halt["kind"]).label,
@@ -245,15 +251,32 @@ class DashboardState:
             out["daily_loss_pct"] = _r(max((start - eq) / start * 100, 0.0))
         if eq and peak:
             out["drawdown_pct"] = _r(max((peak - eq) / peak * 100, 0.0))
+        if (prog := self.guard.target_progress(eq)):
+            out["target"] = {"pct": prog["pct"], "goal": _r(prog["goal"]), "gain": _r(prog["gain"]),
+                             "ratio": _r(prog["ratio"], 4), "start_cash": _r(prog["start_cash"]),
+                             "done_today": state.get("target_done_day") == state.get("day")}
         return out
+
+    def _limits(self) -> dict:
+        """하루 매수 횟수·보유 종목 수 (거래 옵션 한도 대비)."""
+        p = self.ma_params
+        snap = self.account.snapshot if self.account else None
+        held = {s for s, h in snap.holdings.items() if h.quantity > 0} if snap else set()
+        pending = self.orders.pending_buy_symbols() if self.orders else set()
+        buys = sum(self.orders.buys_today(s) for s in {o.symbol for o in self.orders.orders}) if self.orders else 0
+        return {"buys_today": buys, "max_buys": p.max_buys_per_day, "positions": len(held | pending),
+                "max_positions": p.max_positions, "target_pct": p.daily_profit_target_pct}
 
     def _positions(self) -> list[dict]:
         snap = self.account.snapshot if self.account else None
         if snap is None:
             return []
-        tp, sl = self.ma_params.take_profit_pct, self.ma_params.stop_loss_pct
         rows = []
+        current = self.presets.active_name if self.presets else ""
         for sym, h in sorted(snap.holdings.items()):
+            rule = self.book.get(sym) if self.book else None   # 산 때 옵션 기준 (없으면 지금 설정)
+            tp = rule.take_profit_pct if rule else self.ma_params.take_profit_pct
+            sl = rule.stop_loss_pct if rule else self.ma_params.stop_loss_pct
             price = self._price(sym, h.current_price)
             pnl_pct = (price / h.avg_price - 1) * 100 if h.avg_price else 0.0
             tick = self.ticks.get(sym)
@@ -266,6 +289,7 @@ class DashboardState:
                 "tp_price": _r(h.avg_price * (1 + tp / 100), 4), "sl_price": _r(h.avg_price * (1 - sl / 100), 4),
                 "to_tp_pct": _r(tp - pnl_pct), "to_sl_pct": _r(pnl_pct + sl),
                 "live": tick is not None,
+                "preset": rule.preset_name if rule else current, "preset_recorded": rule is not None,
             })
         return rows
 
@@ -315,5 +339,6 @@ class DashboardState:
             "take_profit_pct": p.take_profit_pct, "stop_loss_pct": p.stop_loss_pct,
             "budget_per_trade_usd": _r(p.budget_per_trade_usd), "max_positions": p.max_positions,
             "sessions": [s.label for s in p.sessions],
+            "preset": self.presets.active_name if self.presets else None,
         }
 

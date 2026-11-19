@@ -61,8 +61,17 @@ class _Pos:
 
 
 class _Ctx:
-    def __init__(self, positions: dict[str, _Pos]):
+    def __init__(self, positions: dict[str, _Pos], buys_today: Callable[[], int] = lambda: 0):
         self._p = positions
+        self.buys_today = buys_today
+        self.sold_at: dict[str, datetime] = {}
+
+    def last_sell_at(self, symbol: str) -> datetime | None:
+        return self.sold_at.get(symbol)
+
+    def entry_time(self, symbol: str) -> datetime | None:
+        p = self._p.get(symbol)
+        return p.opened if p else None
 
     def position(self, symbol: str):
         return self._p.get(symbol)
@@ -75,13 +84,15 @@ class _Ctx:
 class _Day:
     date: date
     start_equity: float
+    start_cash: float = 0.0
     orders: int = 0
     buys: dict[str, int] = field(default_factory=dict)
 
 
-def _tick(symbol: str, price: float, prev_close: float | None, t: datetime) -> Tick:
+def _tick(symbol: str, price: float, prev_close: float | None, t: datetime, volume: float = 0.0) -> Tick:
+    """가상 틱. 체결강도·호가는 분봉에 없어 0 → 그 거르개는 백테스트에서 적용되지 않는다."""
     rate = (price / prev_close - 1) * 100 if prev_close else 0.0
-    return Tick(symbol, symbol, price, price, price, price, 0.0, rate, 0.0, 0.0, 0.0, 0.0, 0.0, "", t, 0.0)
+    return Tick(symbol, symbol, price, price, price, price, 0.0, rate, 0.0, 0.0, volume, 0.0, 0.0, "", t, 0.0)
 
 
 def _path(bar: Bar) -> list[float]:
@@ -134,7 +145,7 @@ class Backtest:
 
         cash = self.bt.start_cash
         positions: dict[str, _Pos] = {}
-        ctx = _Ctx(positions)
+        ctx = _Ctx(positions, lambda: sum(day.buys.values()) if day else 0)
         last_price: dict[str, float] = {}
         prev_close: dict[str, float] = {}           # 전 거래일 정규장 종가
         today_reg_close: dict[str, float] = {}
@@ -145,9 +156,9 @@ class Backtest:
         fees_total = 0.0
         day: _Day | None = None
         peak: float | None = None
-        halt: str | None = None                       # None / DAILY_LOSS / MAX_DRAWDOWN
+        halt: str | None = None                       # None / DAILY_LOSS / DAILY_TARGET / MAX_DRAWDOWN
         liquidate = False
-        skipped = {"cash": 0, "max_orders": 0, "buys_per_symbol": 0, "halt": 0}
+        skipped = {"cash": 0, "max_orders": 0, "buys_per_symbol": 0, "halt": 0}   # 건너뛴 매수 신호
         halts: list[dict] = []
 
         def equity() -> float:
@@ -163,7 +174,7 @@ class Backtest:
             equity_curve.append({"date": day.date.isoformat(), "equity": round(eq, 2), "benchmark": round(bench, 2),
                                  "cash": round(cash, 2), "positions": len(positions)})
             peak = eq if peak is None else max(peak, eq)
-            if halt == "DAILY_LOSS":
+            if halt in ("DAILY_LOSS", "DAILY_TARGET"):
                 halt = None   # 다음 거래일 자동 해제
 
         def execute(sig: Signal, t: datetime, trading: bool) -> None:
@@ -197,10 +208,7 @@ class Backtest:
             pos = positions.get(sig.symbol)
             if pos is None:
                 return
-            if day.orders >= self.order.max_orders_per_day and not sig.reason.startswith("손실 차단"):
-                skipped["max_orders"] += 1   # 실제와 같게 매도도 하루 주문 한도를 따른다 (청산은 예외)
-                return
-            sell(sig.symbol, sig.price, t, sig.reason)
+            sell(sig.symbol, sig.price, t, sig.reason)   # 실제와 같게 매도는 하루 주문 한도와 무관
 
         def sell(symbol: str, signal_price: float, t: datetime, reason: str, count_order: bool = True) -> None:
             nonlocal cash, fees_total
@@ -219,6 +227,7 @@ class Backtest:
                            "pnl": round(pnl, 2), "pnl_pct": round(pnl / (pos.qty * pos.avg_price + pos.buy_fee) * 100, 3),
                            "fees": round(pos.buy_fee + fee, 2), "exit": kind, "reason": reason,
                            "hold_min": round((t - pos.opened).total_seconds() / 60)})
+            ctx.sold_at[symbol] = t
             fills.append({"time": t.isoformat(), "symbol": symbol, "side": "SELL", "qty": pos.qty,
                           "price": round(price, 4), "reason": reason})
 
@@ -243,7 +252,7 @@ class Backtest:
                 # 새 거래일: 전일 정규장 종가 갱신, 예산 재계산, 일일 카운터 초기화
                 prev_close.update(today_reg_close)
                 today_reg_close.clear()
-                day = _Day(d, equity())
+                day = _Day(d, equity(), cash)
                 if d >= self.bt.start and self.ma.capital_usage_pct > 0:   # 실제와 같게 거래일 시작 현금으로 종목당 예산
                     strategy.p = replace(self.ma, budget_per_trade_usd=cash * self.ma.capital_usage_pct / 100
                                          / self.ma.max_positions)
@@ -265,7 +274,7 @@ class Backtest:
             for k, price in enumerate(prices):
                 tick_time = t + timedelta(seconds=min(59, k * 59 // max(1, len(prices) - 1)))
                 last_price[sym] = price
-                tick = _tick(sym, price, prev_close.get(sym), tick_time)
+                tick = _tick(sym, price, prev_close.get(sym), tick_time, bar.volume / len(prices))   # 봉 거래량을 나눠 실음
                 for sig in strategy.on_tick(tick, session, ctx):
                     execute(sig, tick_time, trading)
             if session is Session.REGULAR:
@@ -284,9 +293,15 @@ class Backtest:
                     halt = "DAILY_LOSS"
                     liquidate = self.risk.daily_loss_action == "liquidate"
                     halts.append({"time": t.isoformat(), "kind": "하루 손실", "equity": round(eq, 2)})
+                target = strategy.p.daily_profit_target_pct
+                if not halt and target and day.start_cash and eq - day.start_equity >= day.start_cash * target / 100:
+                    halt, liquidate = "DAILY_TARGET", True   # 하루 목표 달성 → 전부 매도, 그날 종료
+                    halts.append({"time": t.isoformat(), "kind": "하루 목표", "equity": round(eq, 2)})
                 if liquidate and positions:
+                    label = {"MAX_DRAWDOWN": "손실 차단 청산 (최대 낙폭)", "DAILY_LOSS": "손실 차단 청산 (하루 손실)",
+                             "DAILY_TARGET": "목표달성 청산 (하루 목표)"}[halt]
                     for s in list(positions):
-                        sell(s, last_price[s], t, f"손실 차단 청산 ({'최대 낙폭' if halt == 'MAX_DRAWDOWN' else '하루 손실'})")
+                        sell(s, last_price[s], t, label)
                 if not halt:
                     liquidate = False
         close_day()
