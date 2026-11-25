@@ -3,6 +3,9 @@
 저장 위치 (data/ 는 git 에서 제외 → PC 마다 따로 쌓인다)
     data/reports/{env}/trades/YYYY-MM-DD.csv    주문 1건 = 1행 (재시작해도 같은 날 파일에 이어서 기록)
     data/reports/{env}/daily/YYYY-MM-DD.json    그날 정산 보고서 (보유 종목·매매내역 포함)
+
+장중에도 1분마다 매매내역과 '진행 중' 보고서를 저장한다 (final=False). 거래일이 끝나면 최종 정산(final=True).
+그래서 프로그램이 도중에 꺼져도(창 닫기·절전·재부팅) 그때까지의 매매내역과 정산은 남는다.
     data/reports/{env}/daily_summary.csv        하루 1행 누적 요약 (같은 날 다시 정산하면 덮어씀)
 
 날짜는 미국 현지(ET) 거래일 기준. CSV 는 엑셀(Windows/macOS)에서 한글이 깨지지 않도록 UTF-8 BOM 으로 저장한다.
@@ -40,7 +43,7 @@ TRADE_FIELDS = [
 SUMMARY_FIELDS = [
     "date", "env", "orders", "filled_orders", "buy_amount", "sell_amount", "realized_pnl",
     "wins", "losses", "start_equity", "end_equity", "equity_change", "return_pct", "unrealized_pnl",
-    "exchange_rate",
+    "exchange_rate", "final",
 ]
 
 
@@ -98,6 +101,7 @@ class DailyReport:
     end_equity: float
     unrealized_pnl: float
     exchange_rate: float = 0.0     # 그날 KIS 환율 (원/USD) — 연간 정산의 원화 환산에 쓴다
+    final: bool = True             # False = 장중 중간 저장 (거래일이 아직 끝나지 않았거나 도중에 꺼짐)
     holdings: list[dict] = field(default_factory=list)
     trades: list[dict] = field(default_factory=list)
 
@@ -116,6 +120,7 @@ class DailyReport:
 
     def summary_row(self) -> dict:
         row = {k: getattr(self, k) for k in SUMMARY_FIELDS}
+        row["final"] = int(self.final)
         return {k: round(v, 4) if isinstance(v, float) else v for k, v in row.items()}
 
     def to_json(self) -> dict:
@@ -126,7 +131,7 @@ class DailyReport:
 
 
 def build_report(trading_date: date, env: str, rows: list[dict], start_equity: float,
-                 end_snap: AccountSnapshot | None) -> DailyReport:
+                 end_snap: AccountSnapshot | None, final: bool = True) -> DailyReport:
     status_counts: dict[str, int] = {}
     buy_amount = sell_amount = realized = 0.0
     wins = losses = filled_orders = 0
@@ -159,7 +164,7 @@ def build_report(trading_date: date, env: str, rows: list[dict], start_equity: f
         start_equity=start_equity, end_equity=_equity(end_snap),
         unrealized_pnl=end_snap.total_pnl if end_snap else 0.0,
         exchange_rate=end_snap.exchange_rate if end_snap else 0.0,
-        holdings=holdings, trades=rows,
+        holdings=holdings, trades=rows, final=final,
     )
 
 
@@ -184,26 +189,20 @@ class SettlementStore:
         return self.root / "daily" / f"{d.isoformat()}.json"
 
     def append_trades(self, d: date, orders: list[Order]) -> None:
+        """이번 실행의 주문을 그날 파일에 반영한다. 같은 주문(주문번호)은 최신 상태로 덮어쓰고,
+        이전 실행(재시작 전)의 행은 그대로 둔다 → 장중에 몇 번을 불러도 중복되지 않는다."""
         if not orders:
             return
-        path = self.trades_path(d)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        new_file = not path.exists()
-        if not new_file:   # 예전 형식(칸이 적은 머리글) 파일이면 새 머리글로 다시 쓴 뒤 이어 쓴다
-            with path.open(encoding=_CSV_ENCODING, newline="") as f:
-                reader = csv.DictReader(f)
-                old_rows, header = list(reader), reader.fieldnames
-            if header != TRADE_FIELDS:
-                def rewrite(f):
-                    w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
-                    w.writeheader()
-                    w.writerows(old_rows)
-                _atomic_write(path, rewrite)
-        with path.open("a", encoding=_CSV_ENCODING if new_file else "utf-8", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=TRADE_FIELDS)
-            if new_file:
-                w.writeheader()
-            w.writerows(trade_row(o, d) for o in orders)
+        rows: dict[str, dict] = {_row_key(r): r for r in self.load_trades(d)}
+        for o in orders:
+            r = trade_row(o, d)
+            rows[_row_key(r)] = r
+
+        def write(f):
+            w = csv.DictWriter(f, fieldnames=TRADE_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows.values())
+        _atomic_write(self.trades_path(d), write)
 
     def load_trades(self, d: date) -> list[dict]:
         path = self.trades_path(d)
@@ -226,7 +225,12 @@ class SettlementStore:
         with self.summary_path.open(encoding=_CSV_ENCODING, newline="") as f:
             rows = list(csv.DictReader(f))
         text = {"date", "env"}
-        return [{k: (v if k in text else _num(v)) for k, v in r.items()} for r in sorted(rows, key=lambda r: r["date"])]
+        out = []
+        for r in sorted(rows, key=lambda r: r["date"]):
+            row = {k: (v if k in text else _num(v)) for k, v in r.items()}
+            row["final"] = r.get("final") in (None, "", "1")   # 예전 파일(칸 없음)은 최종 정산
+            out.append(row)
+        return out
 
     def load_report_json(self, d: date) -> dict | None:
         try:
@@ -259,6 +263,11 @@ class SettlementStore:
         _atomic_write(self.summary_path, write)
 
 
+def _row_key(r: dict) -> str:
+    """주문번호가 있으면 그것, 없으면(거부·미전송) 주문 시각·종목·방향·수량으로 같은 주문을 알아본다."""
+    return r.get("odno") or f"{r.get('placed_at')}|{r.get('symbol')}|{r.get('side')}|{r.get('qty')}"
+
+
 def preset_performance(store: SettlementStore) -> dict[str, dict]:
     """거래 옵션별 실제 매매 성적 (매도 체결 기준: 그 종목을 산 옵션으로 집계)."""
     folder = store.trades_path(date.today()).parent
@@ -287,12 +296,34 @@ def preset_performance(store: SettlementStore) -> dict[str, dict]:
     return out
 
 
-async def settle_day(store: SettlementStore, account: AccountService, orders: list[Order],
-                     trading_date: date, start_snap: AccountSnapshot | None) -> DailyReport | None:
-    """주문 기록 → 최종 잔고 조회 → 보고서 계산·저장. 실패해도 예외를 밖으로 내보내지 않는다."""
+def save_progress(store: SettlementStore, account: AccountService, orders: list[Order],
+                  trading_date: date, start_snap: AccountSnapshot | None) -> DailyReport | None:
+    """장중 중간 저장: 매매내역 + '진행 중' 보고서 (마지막으로 조회한 잔고 기준, API 호출 없음).
+    프로그램이 도중에 꺼져도 정산 화면에 그때까지의 결과가 남는다. 실패해도 예외를 내보내지 않는다."""
     try:
         store.append_trades(trading_date, orders)
-    except OSError as e:
+        prev = store.load_report_json(trading_date)
+        if prev and prev.get("final", True) and not orders:
+            return None   # 이미 최종 정산한 날을 빈 중간 저장으로 덮지 않는다
+        start_equity = store.saved_start_equity(trading_date)
+        if start_equity is None:
+            start_equity = _equity(start_snap)
+        report = build_report(trading_date, store.env, store.load_trades(trading_date), start_equity,
+                              account.snapshot, final=False)
+        store.save_report(report)
+        return report
+    except (OSError, ValueError, KeyError) as e:
+        log.warning("정산 중간 저장 실패 (매매는 계속): %s", e)
+        return None
+
+
+async def settle_day(store: SettlementStore, account: AccountService, orders: list[Order],
+                     trading_date: date, start_snap: AccountSnapshot | None, final: bool = True) -> DailyReport | None:
+    """주문 기록 → 최종 잔고 조회 → 보고서 계산·저장. 실패해도 예외를 밖으로 내보내지 않는다.
+    final=False: 거래일 도중에 멈춘 경우 (다시 켜면 같은 날 정산에 이어서 반영)."""
+    try:
+        store.append_trades(trading_date, orders)
+    except (OSError, ValueError) as e:
         log.error("매매내역 저장 실패: %s", e)
 
     try:
@@ -305,7 +336,8 @@ async def settle_day(store: SettlementStore, account: AccountService, orders: li
         start_equity = store.saved_start_equity(trading_date)
         if start_equity is None:
             start_equity = _equity(start_snap)
-        report = build_report(trading_date, store.env, store.load_trades(trading_date), start_equity, end_snap)
+        report = build_report(trading_date, store.env, store.load_trades(trading_date), start_equity, end_snap,
+                              final=final)
         store.save_report(report)
     except (OSError, ValueError, KeyError) as e:
         log.error("정산 보고서 생성/저장 실패: %s", e)
@@ -313,7 +345,7 @@ async def settle_day(store: SettlementStore, account: AccountService, orders: li
 
     log_report(report)
     log.info("정산 저장: %s", store.report_path(trading_date))
-    log.info(f"[장 마감 정산] {report.date} 주문 {report.orders}건, 실현손익 ${report.realized_pnl:+,.2f} "
+    log.info(f"[{'장 마감 정산' if final else '중간 정산 (거래일 도중 종료)'}] {report.date} 주문 {report.orders}건, 실현손익 ${report.realized_pnl:+,.2f} "
              f"(익절 {report.wins}/손절 {report.losses}), 평가손익 ${report.unrealized_pnl:+,.2f}, "
              f"총자산 ${report.end_equity:,.2f} ({report.return_pct:+.2f}%)", extra=NOTIFY)
     return report

@@ -32,6 +32,7 @@ from config.settings import BASE_DIR
 from market.minute import MinuteStore
 from report.annual import FeeParams, TaxParams, available_years, compute_annual, sells_csv
 from report.settlement import SettlementStore, preset_performance
+from sim.premarket import PremarketSim, SimStore, summary
 from web.scalp import scalp_view, template_values
 from web.state import DashboardState
 
@@ -360,6 +361,36 @@ def create_app(state: DashboardState, store: SettlementStore, password: str,
         except ValueError as e:
             raise HTTPException(400, str(e)) from None
         return {"ok": True, "id": pid, "message": f"'{final}' 거래 옵션을 만들었습니다. 백테스트로 먼저 확인해 보세요"}
+
+    # ── 프리마켓 시뮬레이션 (모의투자 가상 매매) ─────────────────
+    sim_store = SimStore(data_dir / "sim", store.env)
+
+    @app.get("/api/sim")
+    async def sim_days(request: Request):
+        authed(request)
+        days = await asyncio.to_thread(sim_store.days)
+        live = state.sim
+        if live is not None and live.started:   # 진행 중인 날은 메모리의 최신 값으로
+            days = [d for d in days if d["date"] != live.date.isoformat()] + [summary(live.data)]
+        sp = state.config.params("premarket_sim") if state.config else None
+        return {"env": store.env, "days": sorted(days, key=lambda d: d["date"]),
+                "enabled": sp.enabled if sp else None, "slippage_pct": sp.slippage_pct if sp else None,
+                "active": live is not None and live.started and not live.closed}
+
+    @app.get("/api/sim/{day}")
+    async def sim_day(day: str, request: Request):
+        authed(request)
+        try:
+            d = date.fromisoformat(day)
+        except ValueError:
+            raise HTTPException(400, "날짜 형식 오류 (예: 2026-11-25)") from None
+        live = state.sim
+        if live is not None and live.date == d and live.started:
+            return live.view()
+        data = await asyncio.to_thread(sim_store.load, d)
+        if data is None:
+            raise HTTPException(404, f"{day} 프리마켓 시뮬레이션 기록이 없습니다")
+        return PremarketSim.view_of(data)
 
     @app.get("/api/reports")
     async def reports(request: Request):

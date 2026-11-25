@@ -119,6 +119,18 @@ export type Snapshot = {
   watch: Watch[];
   events: LogEvent[];
   strategy: StrategyInfo;
+  gainers: Gainers | null;   // 급등주 선정 (켜져 있고 거래일 중일 때)
+};
+
+export type Gainers = {
+  enabled: boolean;
+  refresh_min: number;
+  top_n: number;
+  min_change_rate: number;
+  min_price: number;
+  min_volume: number;
+  picked_at: string | null;
+  rows: { symbol: string; exchange: string; name: string; rate: number; price: number; volume: number }[];
 };
 
 export type SummaryDay = {
@@ -136,6 +148,7 @@ export type SummaryDay = {
   equity_change: number;
   return_pct: number;
   unrealized_pnl: number;
+  final: boolean;   // false = 장중 중간 저장 (거래일 진행 중이거나 도중에 꺼짐)
 };
 
 export type TradeRow = {
@@ -154,6 +167,8 @@ export type TradeRow = {
 
 export type DayReport = {
   date: string;
+  generated_at: string;
+  final?: boolean;
   orders: number;
   status_counts: Record<string, number>;
   realized_pnl: number;

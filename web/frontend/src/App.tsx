@@ -8,11 +8,12 @@ import Settings from "./Settings";
 import Backtest from "./Backtest";
 import Presets from "./Presets";
 import Scalp from "./Scalp";
+import Sim from "./Sim";
 
 type Auth = "checking" | "in" | "out" | "offline";
-export type Tab = "live" | "reports" | "backtest" | "presets" | "scalp" | "settings";
+export type Tab = "live" | "reports" | "sim" | "backtest" | "presets" | "scalp" | "settings";
 
-const tabFromHash = (): Tab => (location.hash.startsWith("#reports") ? "reports" : location.hash === "#settings" ? "settings" : location.hash === "#backtest" ? "backtest" : location.hash === "#presets" ? "presets" : location.hash === "#scalp" ? "scalp" : "live");
+const tabFromHash = (): Tab => (location.hash.startsWith("#reports") ? "reports" : location.hash === "#settings" ? "settings" : location.hash === "#backtest" ? "backtest" : location.hash === "#presets" ? "presets" : location.hash === "#scalp" ? "scalp" : location.hash === "#sim" ? "sim" : "live");
 export type Link = "connecting" | "live" | "lost";
 
 const STALE_MS = 5000;
@@ -101,7 +102,7 @@ export default function App() {
   return (
     <div className="app">
       <Header snap={snap} link={link} tab={tab} onLogout={logout} />
-      <main>{tab === "live" ? snap && <Live snap={snap} /> : tab === "reports" ? <Reports /> : tab === "backtest" ? <Backtest /> : tab === "presets" ? <Presets /> : tab === "scalp" ? <Scalp /> : <Settings />}</main>
+      <main>{tab === "live" ? snap && <Live snap={snap} /> : tab === "reports" ? <Reports /> : tab === "backtest" ? <Backtest /> : tab === "presets" ? <Presets /> : tab === "scalp" ? <Scalp /> : tab === "sim" ? <Sim /> : <Settings />}</main>
     </div>
   );
 }

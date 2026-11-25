@@ -27,18 +27,24 @@ function DailyReports() {
   const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
-    fetch("/api/reports")
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
-      .then((d) => {
-        setDays(d.days);
-        if (d.days.length) setSelected(d.days[d.days.length - 1].date);
-      })
-      .catch(() => setError("정산 데이터를 불러오지 못했습니다."));
+    // 장중에도 1분마다 중간 저장되므로 주기적으로 다시 불러온다
+    const load = () =>
+      fetch("/api/reports")
+        .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+        .then((d) => {
+          setDays(d.days);
+          setError("");
+          if (d.days.length) setSelected((s) => s ?? d.days[d.days.length - 1].date);
+        })
+        .catch(() => setError("정산 데이터를 불러오지 못했습니다."));
+    load();
+    const t = setInterval(load, 60_000);
+    return () => clearInterval(t);
   }, []);
 
   if (error) return <div className="empty">{error}</div>;
   if (!days) return <div className="empty">불러오는 중…</div>;
-  if (!days.length) return <div className="empty">아직 정산 기록이 없습니다. 거래일이 끝나면 자동으로 쌓입니다.</div>;
+  if (!days.length) return <div className="empty">아직 정산 기록이 없습니다. 매매 중에는 1분마다 중간 저장되고, 거래일이 끝나면 최종 정산됩니다.</div>;
 
   const total = days.reduce((s, d) => s + d.realized_pnl, 0);
   const wins = days.reduce((s, d) => s + d.wins, 0);
@@ -78,7 +84,7 @@ function DailyReports() {
             <tbody>
               {[...days].reverse().map((d) => (
                 <tr key={d.date} className={`clickable ${selected === d.date ? "selected" : ""}`} onClick={() => setSelected(d.date)}>
-                  <td className="num">{d.date}</td>
+                  <td className="num">{d.date}{!d.final && <span className="pill tone-info day-live">진행 중</span>}</td>
                   <td className="r num">{d.orders}</td>
                   <td className="r num">{d.filled_orders}</td>
                   <td className={`r num tone-${tone(d.realized_pnl)}`}>{usd(d.realized_pnl, { sign: true })}</td>
@@ -92,7 +98,7 @@ function DailyReports() {
         </div>
       </section>
 
-      {selected && <DayDetail day={selected} />}
+      {selected && <DayDetail day={selected} version={days.find((d) => d.date === selected)} />}
     </div>
   );
 }
@@ -157,29 +163,37 @@ function DailyChart({ days, selected, onSelect }: { days: SummaryDay[]; selected
   );
 }
 
-function DayDetail({ day }: { day: string }) {
+function DayDetail({ day, version }: { day: string; version?: SummaryDay }) {
   const [rep, setRep] = useState<DayReport | null>(null);
   const [error, setError] = useState("");
+  const shown = useRef("");
   useEffect(() => {
-    setRep(null);
+    if (shown.current !== day) setRep(null);   // 같은 날 새로고침은 화면을 비우지 않는다
+    shown.current = day;
     setError("");
     fetch(`/api/reports/${day}`)
       .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .then(setRep)
       .catch(() => setError(`${day} 보고서를 불러오지 못했습니다.`));
-  }, [day]);
+  }, [day, version?.orders, version?.end_equity, version?.final]);
 
   if (error) return <div className="empty">{error}</div>;
   if (!rep) return <div className="empty">불러오는 중…</div>;
   return (
     <section className="panel">
       <div className="panel-head">
-        <h2>{rep.date} 상세</h2>
+        <h2>{rep.date} 상세{rep.final === false && <span className="pill tone-info day-live">진행 중</span>}</h2>
         <span className="panel-note">
           매수 {usd(rep.buy_amount)} · 매도 {usd(rep.sell_amount)} · 실현 {usd(rep.realized_pnl, { sign: true })} ·
           승률 {rep.win_rate.toFixed(0)}% · 마감 보유 {rep.holdings.length}종목
         </span>
       </div>
+      {rep.final === false && (
+        <p className="day-note">
+          {rep.generated_at.slice(5, 16).replace("T", " ")} (한국 시각) 중간 저장 기준입니다. 거래일이 끝나면 최종 정산으로 바뀝니다.
+          프로그램이 도중에 꺼졌다면 꺼지기 직전 저장 내용입니다.
+        </p>
+      )}
       {rep.trades.length === 0 ? <div className="empty">이날 주문이 없습니다.</div> : (
         <div className="table-scroll tall">
           <table>

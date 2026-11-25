@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import type { Order, Position, Risk, Snapshot, Watch } from "./types";
+import type { Gainers, Order, Position, Risk, Snapshot, Watch } from "./types";
 import { krw, num, pct, tone, usd } from "./format";
 import Controls from "./Controls";
 
@@ -30,6 +30,13 @@ export default function Live({ snap }: { snap: Snapshot }) {
           <Events snap={snap} />
         </Panel>
       </div>
+
+      {snap.gainers && (
+        <Panel title="급등주 선정" count={snap.gainers.rows.length}
+               note={`${snap.gainers.picked_at ? `${snap.gainers.picked_at} 선정` : "아직 선정 전"} · ${snap.gainers.refresh_min}분마다 다시 · 등락률 ${snap.gainers.min_change_rate}% 이상 · $${snap.gainers.min_price} 이상 · 거래량 ${snap.gainers.min_volume.toLocaleString()}주 이상 · 상위 ${snap.gainers.top_n}개`}>
+          <GainerTable g={snap.gainers} />
+        </Panel>
+      )}
 
       <Panel title="감시 종목" count={snap.watch.length}
              note={`${snap.strategy.bar_minutes}분봉 MA${snap.strategy.short_window}/MA${snap.strategy.long_window} · ${off.has("change_rate") ? "등락률 제한 끔" : `등락률 ${snap.strategy.min_change_rate}~${snap.strategy.max_change_rate}%`} · 1회 ${usd(snap.strategy.budget_per_trade_usd)} · ${snap.strategy.max_positions ? `최대 ${snap.strategy.max_positions}종목` : "종목 수 제한 없음"} · ${snap.strategy.sessions.join("/")}`}>
@@ -200,7 +207,33 @@ function Events({ snap }: { snap: Snapshot }) {
   );
 }
 
-const SOURCES = ["전체", "보유", "미체결", "관심", "선정"] as const;
+const SOURCES = ["전체", "보유", "미체결", "급등", "관심", "선정"] as const;
+
+function GainerTable({ g }: { g: Gainers }) {
+  if (!g.rows.length)
+    return <Empty>{g.picked_at ? "조건에 맞는 종목이 없습니다. 다음 선정 때 다시 확인합니다." : "프리마켓·정규장이 시작되면 고릅니다."}</Empty>;
+  return (
+    <div className="table-scroll">
+      <table>
+        <thead>
+          <tr><th className="r">순위</th><th>종목</th><th>이름</th><th className="r">현재가</th><th className="r">등락률</th><th className="r">거래량</th></tr>
+        </thead>
+        <tbody>
+          {g.rows.map((r, i) => (
+            <tr key={r.symbol}>
+              <td className="r num muted">{i + 1}</td>
+              <td><Sym symbol={r.symbol} sub={r.exchange} /></td>
+              <td className="muted">{r.name}</td>
+              <td className="r num">{usd(r.price)}</td>
+              <td className={`r num tone-${tone(r.rate)}`}>{pct(r.rate)}</td>
+              <td className="r num">{r.volume.toLocaleString()}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 function WatchTable({ rows, phase }: { rows: Watch[]; phase: string }) {
   const [filter, setFilter] = useState<(typeof SOURCES)[number]>("전체");

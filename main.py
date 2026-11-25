@@ -29,6 +29,7 @@ import logging
 import sys
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 
@@ -47,15 +48,17 @@ from core.notifier import NOTIFY, setup_slack
 from core.logger import setup_logging
 from core.ws_client import KisWebSocket, Tick
 from market.bars import fetch_minute_bars
-from market.clock import ET, MarketClock, Session, fmt_kst
-from risk.guard import RiskGuard, RiskParams, RiskStore, apply_command_offline, describe_state
+from market.clock import ET, KST, MarketClock, Session, fmt_kst
+from risk.guard import HaltKind, RiskGuard, RiskParams, RiskStore, apply_command_offline, describe_state
 from market.daily import DEFAULT_DAILY_COUNT, collect_daily
+from market.gainers import Gainer, GainerLog, GainersParams, fetch_rank_rows, load_master_info, pick
 from market.universe import load_universe
 from market.watchlist import MAX_SYMBOLS, QUOTE_EXCHANGE, WatchItem, load_screen_result, load_watchlist, merge_watchlists
 from backtest.runs import RunStore, run_backtest
 from market.minute import MinuteStore, collect_minutes
 from report.annual import available_years, compute_annual, log_annual, save_annual
-from report.settlement import SettlementStore, log_report, settle_day
+from report.settlement import SettlementStore, log_report, save_progress, settle_day
+from sim.premarket import PremarketSim, SimStore
 from strategy.ma_cross import TOGGLES as MA_TOGGLES, MovingAverageCrossStrategy
 from strategy.positions import PositionBook
 from strategy.screener import ScreenerParams, run_screen
@@ -69,6 +72,7 @@ _WATCHLIST_PATH = BASE_DIR / "config" / "watchlist.csv"
 _STRATEGY_PATH = BASE_DIR / "config" / "strategy.toml"
 _TICK_LOG_INTERVAL = 30.0     # 종목별 시세 로그 출력 간격(초)
 _MAX_IDLE_SLEEP = 300.0       # 대기 중 시계를 다시 확인하는 최대 간격 (PC 절전 복귀 대비)
+_PROGRESS_SAVE_SEC = 60.0     # 장중 정산 중간 저장 간격(초)
 
 
 async def bootstrap(client: KisClient, account: AccountService) -> AccountSnapshot:
@@ -201,10 +205,104 @@ async def warm_up(client: KisClient, strategy: MovingAverageCrossStrategy,
     await asyncio.gather(*(one(item) for item in watchlist))
 
 
+class GainerSelector:
+    """급등주 선정: 프리마켓·정규장 동안 refresh_min 분마다 상승률 순위로 다시 고르고 감시·매수 대상을 바꾼다.
+    빠진 종목은 신규 매수만 멈추고, 보유 중이면 산 옵션의 매도 기준으로 계속 감시한다."""
+
+    def __init__(self, client: KisClient, cfg: LiveConfig, clock: MarketClock, trading_date: date):
+        self._c, self._cfg, self._clock, self._date = client, cfg, clock, trading_date
+        self._log = GainerLog(BASE_DIR / "data", client.settings.env)
+        self._master = load_master_info(BASE_DIR / "data" / "universe") if self.params.enabled else None
+        if self.params.enabled and self._master is None:
+            log.warning("[급등주] 종목 마스터 파일이 없어 ETF 를 이름으로만 거릅니다 (--collect-daily 한 번 실행 권장)")
+        self.watcher: HoldingWatcher | None = None
+        self.current: list[Gainer] = []
+        self.picked_at: datetime | None = None
+        self._next = 0.0
+        self._task: asyncio.Task | None = None
+
+    @property
+    def params(self) -> GainersParams:
+        return self._cfg.params("gainers")
+
+    @property
+    def symbols(self) -> set[str]:
+        return {g.symbol for g in self.current}
+
+    def active(self, session: Session) -> bool:
+        return self.params.enabled and session in (Session.PRE, Session.REGULAR)
+
+    async def select(self) -> list[Gainer]:
+        p = self.params
+        if self._master is None:
+            self._master = load_master_info(BASE_DIR / "data" / "universe")
+        rows = await fetch_rank_rows(self._c)
+        if not any(rows.values()):   # 장중에 순위가 통째로 비면 서버 문제로 보고 기존 목록 유지
+            raise KisError("상승률 순위를 하나도 받지 못함")
+        picked = pick(rows, p, self._master)
+        old = self.symbols
+        self.current, self.picked_at = picked, self._clock.now()
+        self._next = time.monotonic() + p.refresh_min * 60
+        try:
+            self._log.append(self._date, picked)
+        except OSError as e:
+            log.warning("[급등주] 선정 기록 저장 실패: %s", e)
+        new = [g.symbol for g in picked if g.symbol not in old]
+        gone = sorted(old - self.symbols)
+        log.info("[급등주] %d종목 선정 (등락률 %g%% 이상, $%g 이상, 거래량 %s주 이상, %d분 뒤 다시): %s%s%s",
+                 len(picked), p.min_change_rate, p.min_price, f"{p.min_volume:,}", p.refresh_min,
+                 ", ".join(f"{g.symbol} {g.rate:+.1f}%" for g in picked) or "조건에 맞는 종목 없음",
+                 f" | 새로 {', '.join(new)}" if old and new else "", f" | 빠짐 {', '.join(gone)}" if gone else "")
+        return picked
+
+    def check(self, session: Session) -> None:
+        """매매 루프에서 매초 호출. 때가 되면 다시 고르기를 백그라운드로 (틱 처리를 막지 않게)."""
+        if not self.active(session) or time.monotonic() < self._next or (self._task and not self._task.done()):
+            return
+        self._next = time.monotonic() + 60   # 실패해도 1분 뒤 재시도
+        self._task = asyncio.create_task(self._refresh(), name="gainers")
+
+    async def _refresh(self) -> None:
+        before = self.symbols
+        try:
+            picked = await self.select()
+        except KisError as e:
+            log.warning("[급등주] 다시 고르기 실패 → 1분 뒤 재시도 (기존 목록 유지): %s", e)
+            return
+        if not self.watcher:
+            return
+        try:
+            for sym in sorted(before - self.symbols):
+                await self.watcher.release_target(sym, "급등주에서 빠짐")
+            for g in picked:
+                if g.symbol not in before:
+                    await self.watcher.add_target(g.item)
+        except Exception:
+            log.exception("[급등주] 감시 종목 바꾸기 실패 (다음 선정 때 다시 맞춤)")
+
+    async def close(self) -> None:
+        if self._task:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    def view(self) -> dict:
+        p = self.params
+        return {"enabled": p.enabled, "refresh_min": p.refresh_min, "top_n": p.top_n,
+                "min_change_rate": p.min_change_rate, "min_price": p.min_price, "min_volume": p.min_volume,
+                "picked_at": self.picked_at.astimezone(KST).strftime("%H:%M") if self.picked_at else None,
+                "rows": [{"symbol": g.symbol, "exchange": g.exchange, "name": g.name, "rate": round(g.rate, 2),
+                          "price": g.price, "volume": g.volume} for g in self.current]}
+
+
 def build_trading_list(clock: MarketClock, watchlist: list[WatchItem], account: AccountService,
-                       orders: OrderManager) -> tuple[list[WatchItem], set[str]]:
-    """오늘 실시간으로 받을 종목: 보유(익절·손절 감시) > 미체결 > 관심(watchlist.csv) > 전날 종목 선정 결과.
-    반환: (감시 종목, 매수 대상 종목 = 관심 + 선정). 매수 대상이 아닌 종목은 보유·미체결이 끝나면 감시를 해제한다."""
+                       orders: OrderManager, gp: GainersParams | None = None,
+                       gainers: list[WatchItem] = ()) -> tuple[list[WatchItem], set[str]]:
+    """오늘 실시간으로 받을 종목: 보유(익절·손절 감시) > 미체결 > 급등주 > 관심(watchlist.csv) > 전날 종목 선정 결과.
+    반환: (감시 종목, 매수 대상 종목 = 급등주 + 관심 + 선정). 매수 대상이 아닌 종목은 보유·미체결이 끝나면 감시를 해제한다.
+    급등주 선정이 켜져 있고 '관심·선정 종목도 매매'가 꺼져 있으면 관심·선정 종목은 빼고 급등주만 매수 대상."""
+    only_gainers = bool(gp and gp.enabled and not gp.include_watchlist)
+    if only_gainers:
+        watchlist = []
     snap = account.snapshot
     held = [WatchItem(h.symbol, h.exchange, h.name) for h in (snap.holdings.values() if snap else [])
             if h.exchange in QUOTE_EXCHANGE]
@@ -216,14 +314,15 @@ def build_trading_list(clock: MarketClock, watchlist: list[WatchItem], account: 
     except (OSError, ValueError) as e:
         log.warning("[screener] 설정 오류 → 선정 종목 제외: %s", e)
     else:
-        if screener.add_to_watchlist:
+        if screener.add_to_watchlist and not only_gainers:
             day = clock.last_closed_trading_day()
             path = BASE_DIR / "data" / "screen" / f"{day.isoformat()}.csv"
             screened = load_screen_result(path)
             if not path.exists():
                 log.info("%s 종목 선정 결과 없음 (--collect-daily → --screen 실행 시 추가됨)", day)
-    merged = merge_watchlists([("보유", held), ("미체결", pending), ("관심", watchlist), ("선정", screened)])
-    return merged, {w.symbol for w in (*watchlist, *screened)}
+    merged = merge_watchlists([("보유", held), ("미체결", pending), ("급등", list(gainers)), ("관심", watchlist),
+                               ("선정", screened)])
+    return merged, {w.symbol for w in (*gainers, *watchlist, *screened)}
 
 
 class HoldingWatcher:
@@ -242,6 +341,7 @@ class HoldingWatcher:
         self._targets = targets
         self._last_snap = account.snapshot
         self._tasks: set[asyncio.Task] = set()
+        self.keep: Callable[[str], bool] = lambda _sym: False   # 프리마켓 가상 매매 보유 종목도 감시 유지
 
     async def check(self) -> None:
         snap = self._account.snapshot
@@ -251,7 +351,8 @@ class HoldingWatcher:
         held = {s: h for s, h in snap.holdings.items() if h.quantity > 0 and h.exchange in QUOTE_EXCHANGE}
         pending = {o.symbol for o in self._orders.open_orders()}
 
-        for sym in [s for s in self.subscribed if s not in self._targets and s not in held and s not in pending]:
+        for sym in [s for s in self.subscribed if s not in self._targets and s not in held and s not in pending
+                    and not self.keep(s)]:
             await self._drop(sym, "보유 0주")
         for sym, h in held.items():
             if sym in self.subscribed:
@@ -272,6 +373,35 @@ class HoldingWatcher:
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
 
+    async def add_target(self, item: WatchItem) -> bool:
+        """매수 대상 추가 (급등주 새로 선정): 실시간 등록 + 과거 분봉 로드. 한도가 차 있으면 False."""
+        self._targets.add(item.symbol)
+        if item.symbol in self.subscribed:
+            return True
+        if len(self.subscribed) >= MAX_SYMBOLS:
+            log.warning("[감시 추가 실패] %s: 실시간 한도 %d종목", item.symbol, MAX_SYMBOLS)
+            self._targets.discard(item.symbol)
+            return False
+        self.subscribed[item.symbol] = item
+        self._strategy.add_item(item)
+        await self._ws.subscribe_ticks(item.symbol, item.quote_exchange)
+        log.info("[감시 추가] 급등주 %s → 실시간 시세 등록 (%d종목)", item.symbol, len(self.subscribed))
+        task = asyncio.create_task(warm_up(self._c, self._strategy, [item]), name=f"warm-{item.symbol}")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return True
+
+    async def release_target(self, sym: str, why: str) -> None:
+        """매수 대상에서 뺀다. 보유·미체결이면 감시는 계속 (다 팔리면 check() 가 해제)."""
+        self._targets.discard(sym)
+        snap = self._account.snapshot
+        h = snap.holdings.get(sym) if snap else None
+        if sym in self.subscribed and not (h and h.quantity > 0) and not self._orders.open_orders(sym) \
+                and not self.keep(sym):
+            await self._drop(sym, why)
+        elif sym in self.subscribed:
+            log.info("[급등주] %s 빠짐 → 신규 매수만 중지, 보유 중이라 매도 기준으로 계속 감시", sym)
+
     async def _drop(self, sym: str, why: str) -> None:
         item = self.subscribed.pop(sym)
         await self._ws.unsubscribe_ticks(sym, item.quote_exchange)
@@ -287,8 +417,9 @@ class HoldingWatcher:
 async def stream_quotes(client: KisClient, account: AccountService, clock: MarketClock,
                         watchlist: list[WatchItem], cfg: LiveConfig, store: SettlementStore, risk_store: RiskStore,
                         until: datetime | timedelta, dash: DashboardState | None = None,
-                        presets: PresetStore | None = None, book: PositionBook | None = None) -> None:
+                        presets: PresetStore | None = None, book: PositionBook | None = None) -> bool:
     """until 시각까지 (timedelta 면 준비가 끝난 시점부터 그 시간 동안) 실시간 시세를 받아 전략을 실행하고 주문한다.
+    하루 목표 수익을 달성해 청산까지 끝나면 그 자리에서 거래를 마감하고 정산한다 (반환값 True).
     거래일마다 전략·주문 관리자를 새로 만들고, 끝날 때(오류·중단 포함) 미체결 취소 후 정산한다.
     도중에 설정이 바뀌면(대시보드·파일 수정) 봉 단위·이동평균 기간을 뺀 나머지를 바로 반영한다."""
     cfg.poll(force=True)
@@ -303,7 +434,17 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
         log.warning("기존 미체결 주문 조회 실패 (계속 진행, 중복 주문 주의): %s", e)
     guard = RiskGuard(cfg.risk, risk_store, account, orders, trading_date, order_params.order_timeout_sec)
     await guard.start(guard.equity(), start_cash=start_snap.orderable_usd if start_snap else None)
-    watchlist, targets = build_trading_list(clock, watchlist, account, orders)
+    selector = GainerSelector(client, cfg, clock, trading_date)
+    gp = selector.params
+    if gp.enabled:
+        if selector.active(clock.session()):
+            try:
+                await selector.select()
+            except KisError as e:
+                log.warning("[급등주] 첫 선정 실패 → 1분 뒤 다시 시도: %s", e)
+        else:
+            log.info("[급등주] %s 에는 고르지 않습니다 (프리마켓·정규장에만 선정)", clock.session().label)
+    watchlist, targets = build_trading_list(clock, watchlist, account, orders, gp, [g.item for g in selector.current])
     strategy = MovingAverageCrossStrategy(params, watchlist)
     if presets:
         strategy.preset_info = presets.info        # 매수 신호에 지금 켜진 거래 옵션을 붙인다
@@ -349,13 +490,51 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
     if isinstance(until, timedelta):
         until = clock.now() + until
     watcher = HoldingWatcher(client, ws, strategy, account, orders, watchlist, targets)
+    selector.watcher = watcher
+    if gp.enabled:   # 급등주 모드: 지금 매수 대상(급등주 + 설정에 따라 관심·선정)인 종목만 새로 산다
+        strategy.can_buy = lambda sym: sym in targets
+        # 급등주는 이미 전일 대비 등락률로 골랐으므로 거래 옵션의 '등락률 범위'(예: 0~5%)로 다시 막지 않는다
+        strategy.rate_exempt = lambda sym: sym in selector.symbols
     if dash:
         dash.attach_day(trading_date, orders, guard, strategy, ws, watcher, targets, params)
+        dash.gainers = selector
     ws_task = asyncio.create_task(ws.run(), name="kis-websocket")
     order_task = asyncio.create_task(orders.run(), name="order-sync")
     reporter = TickReporter()
     book_snap = None
     session = clock.session()
+    paper = not client.settings.is_real
+    # 모의투자 프리마켓 가상 매매: 모의 서버가 프리마켓 주문을 받지 않으므로 신호를 가상 계좌에서 체결해 손익을 본다
+    sim: PremarketSim | None = None
+    if paper and cfg.params("premarket_sim").enabled:
+        sim = PremarketSim(SimStore(BASE_DIR / "data" / "sim", client.settings.env), trading_date,
+                           start_snap.orderable_usd if start_snap else 0.0,
+                           fees=lambda: cfg.fees, params=lambda: cfg.params("premarket_sim"))
+        if session is not Session.PRE:
+            sim.close_all("프리마켓이 끝난 뒤 시작")   # 프리마켓 도중 꺼졌던 기록이 있으면 정리 (없으면 아무 일 없음)
+        watcher.keep = sim.holds
+    if dash:
+        dash.sim = sim
+
+    def sim_active(s: Session) -> bool:
+        return sim is not None and s is Session.PRE and not sim.closed
+
+    def order_session(s: Session) -> Session:
+        """모의투자 서버는 정규장 주문만 받는다 (프리·애프터마켓 주문은 '40570000 모의투자 장시작전' 으로 거부).
+        모의투자에서는 정규장 밖을 휴장처럼 다뤄 봉·지표만 쌓고 신호·주문은 내지 않는다."""
+        return Session.CLOSED if paper and s is not Session.REGULAR else s
+
+    def note_paper_session(s: Session) -> None:
+        if sim_active(s) and s in strategy.p.sessions:
+            log.info("[모의투자] 프리마켓은 KIS 모의 서버가 주문을 받지 않아 가상 계좌로 매매합니다 (시뮬레이션, 체결가 %g%% 불리하게) "
+                     "→ 정규장 시작 때 가상 보유 종목은 모두 정리", cfg.params("premarket_sim").slippage_pct)
+        elif paper and s in (Session.PRE, Session.AFTER) and s in strategy.p.sessions:
+            log.info("[모의투자] %s 에는 주문하지 않습니다 (KIS 모의 서버는 정규장 주문만 받음) "
+                     "→ 시세로 봉·지표만 쌓고 정규장부터 매매", s.label)
+
+    note_paper_session(session)
+    target_done = False
+    next_save = time.monotonic() + _PROGRESS_SAVE_SEC
     log.info("실시간 시세 수신 시작: %d종목, %s 까지", len(watchlist), fmt_kst(until))
     try:
         while clock.now() < until:
@@ -363,14 +542,25 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 ws_task.result()   # 복구 불가 예외면 여기서 전파
                 break
             await watcher.check()
+            selector.check(session)
             if book and account.snapshot is not book_snap:   # 잔고가 새로 조회되면 산 옵션 기록을 맞춘다
                 book_snap = account.snapshot
                 book.sync(orders.orders, book_snap)
             current = clock.session()
             if current != session:
                 log.info("세션 전환: %s → %s", session.label, current.label)
+                if sim and session is Session.PRE:
+                    sim.close_all("프리마켓 종료")
                 session = current
-            await guard.check(tradable=session is not Session.CLOSED)
+                note_paper_session(session)
+            if time.monotonic() >= next_save:   # 장중 중간 저장 → 도중에 꺼져도 정산이 남는다
+                next_save = time.monotonic() + _PROGRESS_SAVE_SEC
+                save_progress(store, account, orders.orders, trading_date, start_snap)
+            await guard.check(tradable=order_session(session) is not Session.CLOSED)
+            if guard.halt_kind is HaltKind.DAILY_TARGET and guard.liquidated:
+                log.warning("[하루 목표 달성] 청산 완료 → 오늘 거래를 마감하고 바로 정산합니다", extra=NOTIFY)
+                target_done = True
+                break
             cfg.poll()
             try:
                 tick = await asyncio.wait_for(ws.ticks.get(), timeout=1.0)
@@ -381,8 +571,20 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
             if dash:
                 dash.on_tick(tick)
             orders.on_tick(tick.symbol, tick.price)
+            if sim_active(session) and clock.session() is Session.PRE:   # 가상 계좌로 전략 실행 (봉은 이 한 번만 쌓인다), 실제 주문은 내지 않음
+                sim.on_tick(tick)
+                keep_rule, strategy.exit_rule = strategy.exit_rule, (lambda _sym: None)   # 가상 보유는 현재 옵션 기준
+                try:
+                    for signal in strategy.on_tick(tick, session, sim):
+                        log.info("[시뮬 신호] %s", signal)
+                        sim.execute(signal, tick)
+                except Exception:
+                    log.exception("[%s] 프리마켓 가상 매매 처리 중 오류 → 이 틱은 건너뜀", tick.symbol)
+                finally:
+                    strategy.exit_rule = keep_rule
+                continue
             try:
-                signals = strategy.on_tick(tick, session, ctx)
+                signals = strategy.on_tick(tick, order_session(session), ctx)
             except Exception:
                 log.exception("[%s] 전략 처리 중 오류 → 이 틱은 건너뜀", tick.symbol)
                 continue
@@ -391,18 +593,40 @@ async def stream_quotes(client: KisClient, account: AccountService, clock: Marke
                 orders.submit(signal)
     finally:
         unsubscribe()
+        if sim:
+            if clock.session() is Session.PRE:
+                sim.checkpoint()   # 프리마켓 도중 종료: 상태만 저장 (같은 거래일에 다시 켜면 이어서)
+            else:
+                sim.close_all("프리마켓 종료")
+            if dash:
+                dash.sim = None
         if book:
             book.sync(orders.orders, None)
+        await selector.close()
         await watcher.close()
         await orders.close()
         order_task.cancel()
         await ws.stop()
         await asyncio.gather(ws_task, order_task, return_exceptions=True)
         log.info("실시간 시세 수신 종료 (수신 틱 %d건)", reporter.count)
-        report = await settle_day(store, account, orders.orders, trading_date, start_snap)
+        report = await settle_day(store, account, orders.orders, trading_date, start_snap,
+                                  final=target_done or clock.now() >= until)
         guard.on_settled(report.end_equity if report else None)
         if dash:
             dash.detach_day()
+    return target_done
+
+
+async def wait_after_target(clock: MarketClock, risk_store: RiskStore, until: datetime) -> bool:
+    """목표 달성 마감 후 거래일 끝까지 대기. 그 사이 재개(대시보드·--resume)되면 True 를 돌려 다시 매매한다.
+    대기 중에는 손실 차단 장치가 없으므로 도착한 명령은 상태 파일에 직접 반영한다."""
+    while clock.now() < until:
+        for cmd in risk_store.take_commands():
+            log.info("[명령] %s → %s", cmd, apply_command_offline(risk_store, cmd))
+        if not risk_store.load().get("halt"):
+            return True
+        await asyncio.sleep(min(10.0, max(0.0, (until - clock.now()).total_seconds())))
+    return False
 
 
 async def sleep_until(clock: MarketClock, target: datetime) -> None:
@@ -441,12 +665,19 @@ async def run_forever(client: KisClient, account: AccountService, clock: MarketC
         day_end = clock.trading_day_end(now)
         assert day_end is not None
         try:
-            await stream_quotes(client, account, clock, watchlist, cfg, store, risk_store, until=day_end, dash=dash,
-                                presets=presets, book=book)
+            target_done = await stream_quotes(client, account, clock, watchlist, cfg, store, risk_store,
+                                              until=day_end, dash=dash, presets=presets, book=book)
         except Exception:
             log.exception("시세 수신 중 예기치 못한 오류 → 30초 후 재시작")
             await asyncio.sleep(30)
             continue
+        if target_done and clock.now() < day_end:   # 목표 달성으로 일찍 마감 → 거래일이 끝날 때까지 쉰다
+            log.info("오늘 매매 마감 (하루 목표 달성). 거래일 종료 %s 까지 대기 (재개하면 다시 매매)", fmt_kst(day_end))
+            if dash and (nxt := clock.next_window(day_end)):
+                dash.waiting(nxt)
+            if await wait_after_target(clock, risk_store, day_end):
+                log.warning("[재개] 하루 목표 달성 중지가 해제됨 → 오늘 매매를 다시 시작합니다", extra=NOTIFY)
+                continue
         log.info("거래일 종료 (%s)", fmt_kst(day_end))
         await collect_after_close(client, clock, watchlist)
         if once:

@@ -226,6 +226,8 @@ class MovingAverageCrossStrategy(Strategy):
         # 거래 옵션: 매수 신호에 붙일 현재 옵션 (id, 이름) / 보유 종목의 산 때 매도 기준 (없으면 현재 값)
         self.preset_info: Callable[[], tuple[str, str]] = lambda: ("", "")
         self.exit_rule: Callable[[str], ExitRule | None] = lambda _symbol: None
+        self.can_buy: Callable[[str], bool] = lambda _symbol: True   # 급등주 모드: 지금 선정된 종목만 매수
+        self.rate_exempt: Callable[[str], bool] = lambda _symbol: False   # 급등주: 등락률 범위 거르개를 건너뜀
 
     @property
     def p(self) -> MaCrossParams:
@@ -334,7 +336,8 @@ class MovingAverageCrossStrategy(Strategy):
                     signal = self._check_dead(tick, builder.closes(), pos, rule)
             if signal is None and alt_closed is not None and not cooling:
                 signal = self._check_dead(tick, self._exit_bars[tick.symbol].closes(), pos, rule)
-        elif not pos and not cooling and closed_bar is not None and self.ready(tick.symbol):
+        elif not pos and not cooling and closed_bar is not None and self.ready(tick.symbol) \
+                and self.can_buy(tick.symbol):
             signal = self._check_entry(tick, builder, ctx)
 
         if signal is None:
@@ -396,7 +399,7 @@ class MovingAverageCrossStrategy(Strategy):
                          left, p.rebuy_wait_sec)
                 return None
         rate = tick.change_rate
-        if not p.min_change_rate <= rate <= p.max_change_rate:
+        if not self.rate_exempt(sym) and not p.min_change_rate <= rate <= p.max_change_rate:
             log.info("[%s] %s 신호지만 등락률 %.2f%% 가 범위 밖 → 매수 보류", sym, ENTRY_MODES[p.entry_mode], rate)
             return None
         if p.min_strength and tick.strength and tick.strength < p.min_strength:   # 실시간만 (백테스트는 값 없음)

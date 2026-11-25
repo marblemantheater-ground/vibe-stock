@@ -133,6 +133,7 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
 .src-미체결 { color: var(--warn); }
 .src-관심 { color: var(--accent); }
 .src-선정 { color: var(--muted); }
+.src-급등 { color: var(--up); }
 .trend { font-size: 12px; font-weight: 600; }
 
 .exit-meter { display: grid; grid-template-columns: 44px 120px 44px; align-items: center; gap: 6px; }
@@ -420,3 +421,7 @@ td.reason { max-width: 280px; overflow: hidden; text-overflow: ellipsis; color: 
 td.actions { display: flex; gap: 6px; justify-content: flex-end; }
 .scalp-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 4px; }
 .scalp-head h2 { margin: 0; font-size: 16px; }
+
+/* 정산: 장중 중간 저장 표시 */
+.day-live { margin-left: 8px; vertical-align: middle; font-family: var(--font); }
+.day-note { margin: 0 0 10px; font-size: 13px; color: var(--muted); }

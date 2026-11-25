@@ -86,6 +86,8 @@ class DashboardState:
         self.ws: KisWebSocket | None = None
         self.subscribed: dict | None = None   # HoldingWatcher.subscribed (symbol → WatchItem)
         self.targets: set[str] = set()
+        self.gainers = None   # main.GainerSelector (급등주 선정, 거래일 중에만)
+        self.sim = None       # sim.premarket.PremarketSim (모의투자 프리마켓 가상 매매, 거래일 중에만)
         self.ticks: dict[str, Tick] = {}
         self.tick_count = 0
         self.last_tick_at: datetime | None = None
@@ -106,6 +108,8 @@ class DashboardState:
         """거래일 종료: 실시간 객체만 떼고 마지막 주문 목록은 화면에 남긴다."""
         self.phase = "waiting"
         self.guard, self.strategy, self.ws, self.subscribed = None, None, None, None
+        self.gainers = None
+        self.sim = None
         if self.config:
             self.ma_params = self.config.ma
 
@@ -187,6 +191,7 @@ class DashboardState:
             "watch": self._watch(),
             "events": list(self.events.items)[-120:],
             "strategy": self._strategy(),
+            "gainers": self.gainers.view() if self.gainers and self.gainers.params.enabled else None,
         }
 
     def _status(self) -> dict:
@@ -313,8 +318,9 @@ class DashboardState:
         held = set(snap.holdings) if snap else set()
         pending = {o.symbol for o in self.orders.open_orders()} if self.orders else set()
         rows = []
+        gainers = self.gainers.symbols if self.gainers else set()
         for sym, item in self.subscribed.items():
-            source = ("보유" if sym in held else "미체결" if sym in pending
+            source = ("보유" if sym in held else "미체결" if sym in pending else "급등" if sym in gainers
                       else "관심" if sym in self.manual_symbols else "선정")
             tick = self.ticks.get(sym)
             ind = self.strategy.indicators(sym) if self.strategy else None

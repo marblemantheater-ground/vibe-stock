@@ -25,11 +25,14 @@ from report.annual import FeeParams, TaxParams
 from broker.order import ORDER_TOGGLES
 from risk.guard import RISK_TOGGLES, RiskParams
 from strategy.ma_cross import TOGGLES as MA_TOGGLES, ZERO_OFF as MA_ZERO_OFF, MaCrossParams
+from market.gainers import GainersParams
+from sim.premarket import SimParams
 
 log = logging.getLogger(__name__)
 
 _POLL_SEC = 2.0
-_SECTIONS = {"ma_cross": MaCrossParams, "order": OrderParams, "risk": RiskParams, "fees": FeeParams, "tax": TaxParams}
+_SECTIONS = {"ma_cross": MaCrossParams, "order": OrderParams, "risk": RiskParams, "fees": FeeParams, "tax": TaxParams,
+             "gainers": GainersParams, "premarket_sim": SimParams}
 
 
 @dataclass(frozen=True)
@@ -69,13 +72,38 @@ ON_VALUES = {"cooldown": 300, "rebuy_wait": 60, "volume": 1.5, "trailing": 1.0, 
 _ACTION_OPTS = (("block_buys", "신규 매수만 중지"), ("liquidate", "전부 청산"))
 _SESSION_OPTS = tuple((s.value, s.label) for s in (Session.PRE, Session.REGULAR, Session.AFTER))
 
-GROUPS = ("매수 신호", "스캘핑", "익절·손절", "자금 배분", "하루 목표·한도", "주문", "손실 차단", "수수료·세금", "안전 스위치")
+GROUPS = ("급등주 선정", "프리마켓 시뮬레이션", "매수 신호", "스캘핑", "익절·손절", "자금 배분", "하루 목표·한도", "주문", "손실 차단", "수수료·세금", "안전 스위치")
 
 FIELDS: tuple[Field, ...] = (
     # ── 꺼 둔 기능 목록 (화면에는 각 칸의 스위치로 보인다) ──
     Field("ma_cross", "off", "꺼 둔 기능", "off", "매수 신호", options=tuple(MA_TOGGLES.items())),
     Field("order", "off", "꺼 둔 주문 규칙", "off", "주문", options=tuple(ORDER_TOGGLES.items())),
     Field("risk", "off", "꺼 둔 손실 한도", "off", "손실 차단", options=tuple(RISK_TOGGLES.items())),
+    # ── 급등주 선정 (market/gainers.py) ──
+    Field("gainers", "enabled", "급등주만 골라 매매", "bool", "급등주 선정", apply="next_day",
+          help="켜면 상승률 순위에서 아래 조건에 맞는 종목을 골라 매수 대상으로 삼습니다. 프리마켓 시작부터 일정 간격으로 다시 고르고, "
+               "빠진 종목은 신규 매수만 멈추며 보유 중이면 매도 기준대로 계속 감시합니다. "
+               "급등주에는 거래 옵션의 '등락률 범위'(예: 0~5%)를 적용하지 않습니다 (관심·선정 종목에는 그대로 적용)"),
+    Field("gainers", "include_watchlist", "관심·선정 종목도 매매", "bool", "급등주 선정", apply="next_day",
+          help="끄면 급등주만 매매합니다 (watchlist.csv·종목 선정 결과는 감시하지 않음)"),
+    Field("gainers", "top_n", "고를 종목 수", "int", "급등주 선정", unit="종목", min=1, max=30, step=1,
+          help="조건을 통과한 종목 중 등락률 높은 순으로 이만큼. 다음 선정부터 적용"),
+    Field("gainers", "min_change_rate", "등락률 하한", "number", "급등주 선정", unit="%", min=0, max=1000, step=1,
+          help="전일 종가 대비 이 이상 오른 종목만 (상한 없음)"),
+    Field("gainers", "min_price", "가격 하한", "number", "급등주 선정", unit="USD", min=0, max=10_000, step=0.5),
+    Field("gainers", "min_volume", "거래량 하한", "int", "급등주 선정", unit="주", min=0, max=1_000_000_000, step=50_000,
+          help="오늘 누적 거래량 (프리마켓 포함)"),
+    Field("gainers", "exclude_etf", "ETF·ETN 제외", "bool", "급등주 선정",
+          help="레버리지·인버스 ETF 포함. 워런트·유닛·권리주는 항상 제외"),
+    Field("gainers", "refresh_min", "다시 고르는 간격", "int", "급등주 선정", unit="분", min=1, max=240, step=1),
+    # ── 프리마켓 시뮬레이션 (sim/premarket.py, 모의투자만) ──
+    Field("premarket_sim", "enabled", "모의투자 프리마켓 가상 매매", "bool", "프리마켓 시뮬레이션", apply="next_day",
+          help="KIS 모의 서버는 프리마켓 주문을 받지 않으므로, 모의투자일 때 프리마켓 신호를 가상 계좌(시작 금액 = 모의 계좌 "
+               "주문가능 USD)에서 체결해 손익을 계산합니다. 프리마켓이 끝나면 남은 종목은 마지막 가격으로 판 것으로 정리합니다. "
+               "실제 계좌·정산·손실 한도와는 따로 기록됩니다 (프리마켓 시뮬 탭)"),
+    Field("premarket_sim", "slippage_pct", "체결 가격 불리하게", "number", "프리마켓 시뮬레이션", unit="%", min=0, max=10,
+          step=0.05, help="매수는 매도호가보다, 매도는 매수호가보다 이만큼 불리한 가격으로 체결된 것으로 봅니다 "
+                          "(프리마켓은 호가 차이가 크고 체결이 미끄러지기 쉬움). 0 = 호가 그대로"),
     # ── 매수 신호 ──
     Field("ma_cross", "sessions", "매매할 세션", "sessions", "매수 신호", options=_SESSION_OPTS,
           help="신호를 낼 시간대. 고르지 않은 세션에는 익절·손절 매도도 하지 않습니다"),
